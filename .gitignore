@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.db
+*.db-wal
+*.db-shm
+whatsapp-bridge/whatsapp-bridge
+whatsapp-bridge/store/
+.fly/
+node_modules/
+.DS_Store
+*.egg-info/
+dist/
+build/

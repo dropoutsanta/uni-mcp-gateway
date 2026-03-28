@@ -1,0 +1,41 @@
+app = 'your-app-name'
+primary_region = 'iad'
+
+[build]
+
+[deploy]
+  strategy = "rolling"
+  wait_timeout = "5m"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'off'
+  auto_start_machines = true
+  min_machines_running = 1
+  concurrency_limit = 500
+  idle_timeout = "300s"
+
+  [http_service.proxy]
+    request_timeout = "300s"
+
+  [[http_service.checks]]
+    interval = "10s"
+    timeout = "5s"
+    grace_period = "30s"
+    path = "/health"
+
+[[vm]]
+  size = "performance-1x"
+  memory = "2gb"
+
+[mounts]
+  source = "gateway_data"
+  destination = "/data"
+
+[env]
+  MCP_PORT = "8080"
+  MCP_BASE_URL = "https://your-app-name.fly.dev"
+  GATEWAY_DB_PATH = "/data/gateway.db"
+  # WHATSAPP_DB_PATH = "/data/store/messages.db"
+  # WHATSAPP_BRIDGE_URL = "http://localhost:7481"
