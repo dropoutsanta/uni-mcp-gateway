@@ -662,38 +662,16 @@ def gateway_add_account(key_id: str, plugin: str, account_name: str, credentials
 
 
 @mcp.tool()
-def gateway_set_own_credentials(plugin: str, credentials_json: str) -> dict:
-    """Set your own API credentials for a plugin. Non-admin keys can configure their own accounts.
-
-    Args:
-        plugin: Plugin name (e.g. "gmail", "slack", "calendly")
-        credentials_json: JSON object of credential key/value pairs (e.g. '{"api_key": "xxx"}')
-    """
-    ctx = _current_context.get()
-    if not ctx:
-        return {"error": "No request context"}
-    if not ctx.is_admin:
-        perms = ctx.permissions.get(plugin)
-        if not perms:
-            return {"error": f"You don't have access to plugin '{plugin}'"}
-    try:
-        creds = json.loads(credentials_json)
-    except json.JSONDecodeError:
-        return {"error": "Invalid JSON in credentials_json"}
-    return auth.set_credentials(ctx.key_id, plugin, creds)
-
-
-@mcp.tool()
 def gateway_add_own_account(plugin: str, account_name: str, credentials_json: str) -> dict:
-    """Add a named account for a plugin using your own credentials.
+    """Add your own account for a plugin. Always additive — never touches admin-configured accounts.
 
-    This prefixes credential keys with the account name. For example, adding account "work"
-    with {"api_key": "xxx"} stores "work.api_key". Existing accounts are NOT removed.
+    This prefixes credential keys with the account name. For example, adding account "personal"
+    with {"api_key": "xxx"} stores "personal.api_key". Existing accounts are NOT removed.
 
     Args:
-        plugin: Plugin name (e.g. "calendly", "slack")
+        plugin: Plugin name (e.g. "myplugin", "other_service")
         account_name: Short name for this account (e.g. "work", "personal") — lowercase, no dots
-        credentials_json: JSON object of credential key/value pairs for this account
+        credentials_json: JSON object of credential key/value pairs (e.g. '{"api_key": "xxx", "client_secret": "yyy"}')
     """
     ctx = _current_context.get()
     if not ctx:
@@ -702,6 +680,8 @@ def gateway_add_own_account(plugin: str, account_name: str, credentials_json: st
         perms = ctx.permissions.get(plugin)
         if not perms:
             return {"error": f"You don't have access to plugin '{plugin}'"}
+    if not account_name or not account_name.strip():
+        return {"error": "account_name is required — use a short name like 'work' or 'personal'"}
     if "." in account_name:
         return {"error": "account_name must not contain dots"}
     try:
@@ -741,12 +721,12 @@ def gateway_list_own_credentials() -> dict:
 
 
 @mcp.tool()
-def gateway_remove_own_credentials(plugin: str, account: Optional[str] = None) -> dict:
-    """Remove your own credentials for a plugin, or a specific account within a plugin.
+def gateway_remove_own_account(plugin: str, account: str) -> dict:
+    """Remove one of your own accounts for a plugin. Cannot remove admin-configured credentials.
 
     Args:
         plugin: Plugin name
-        account: If provided, only remove credentials for this account (e.g. "work"). If omitted, removes ALL credentials for the plugin.
+        account: The account name to remove (e.g. "personal", "work")
     """
     ctx = _current_context.get()
     if not ctx:
@@ -755,20 +735,18 @@ def gateway_remove_own_credentials(plugin: str, account: Optional[str] = None) -
         perms = ctx.permissions.get(plugin)
         if not perms:
             return {"error": f"You don't have access to plugin '{plugin}'"}
+    if not account or not account.strip():
+        return {"error": "account is required — specify which account to remove"}
     conn = auth._get_db()
-    if account:
-        conn.execute(
-            "DELETE FROM key_credentials WHERE key_id = ? AND plugin = ? AND credential_key LIKE ?",
-            (ctx.key_id, plugin, f"{account}.%"),
-        )
-    else:
-        conn.execute(
-            "DELETE FROM key_credentials WHERE key_id = ? AND plugin = ?",
-            (ctx.key_id, plugin),
-        )
+    deleted = conn.execute(
+        "DELETE FROM key_credentials WHERE key_id = ? AND plugin = ? AND credential_key LIKE ?",
+        (ctx.key_id, plugin, f"{account}.%"),
+    ).rowcount
     conn.commit()
     conn.close()
-    return {"success": True, "key_id": ctx.key_id, "plugin": plugin, "account_removed": account or "all"}
+    if deleted == 0:
+        return {"error": f"No credentials found for account '{account}' on plugin '{plugin}'"}
+    return {"success": True, "key_id": ctx.key_id, "plugin": plugin, "account_removed": account, "keys_deleted": deleted}
 
 
 @mcp.tool()
@@ -1503,10 +1481,9 @@ async def api_batch(request: Request):
 # ── App assembly ──────────────────────────────────────────────────────────────
 
 _SELF_SERVICE_TOOLS = {
-    "gateway_set_own_credentials",
     "gateway_add_own_account",
     "gateway_list_own_credentials",
-    "gateway_remove_own_credentials",
+    "gateway_remove_own_account",
 }
 
 

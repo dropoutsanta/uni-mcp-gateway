@@ -963,13 +963,17 @@ def _render_dashboard(key_info: dict, request: Request) -> HTMLResponse:
             elif bare_keys:
                 acct_tags = '<span class="account-tag">default</span>'
 
+            remove_btns = ""
+            for acct_name in accounts_list:
+                remove_btns += f'<form method="POST" action="/dash/credentials/remove" style="display:inline" onsubmit="return confirm(\\x27Remove {escape(acct_name)}?\\x27)"><input type="hidden" name="plugin" value="{escape(pname)}"><input type="hidden" name="account" value="{escape(acct_name)}"><button type="submit" class="btn btn-ghost btn-sm" style="color:var(--error);font-size:11px">x {escape(acct_name)}</button></form>'
+
             account_rows.append(f"""<tr>
   <td class="mono">{escape(pname)}</td>
   <td>{status}</td>
   <td>{acct_tags}</td>
   <td style="white-space:nowrap">
-    <button class="btn btn-ghost btn-sm" onclick="openCredsModal('{escape(pname)}')">Configure</button>
-    {f'<form method="POST" action="/dash/credentials/remove" style="display:inline" onsubmit="return confirm(\\x27Remove all {escape(pname)} credentials?\\x27)"><input type="hidden" name="plugin" value="{escape(pname)}"><button type="submit" class="btn btn-ghost btn-sm" style="color:var(--error)">Remove</button></form>' if cred_keys else ''}
+    <button class="btn btn-ghost btn-sm" onclick="openCredsModal('{escape(pname)}')">+ Add Account</button>
+    {remove_btns}
   </td>
 </tr>""")
 
@@ -979,8 +983,8 @@ def _render_dashboard(key_info: dict, request: Request) -> HTMLResponse:
     <form method="POST" action="/dash/credentials/set">
       <input type="hidden" name="plugin" id="creds-plugin-name">
       <div class="form-group">
-        <label>Account Name <span style="font-weight:400;color:var(--text2)">(leave blank for default/single-account)</span></label>
-        <input type="text" name="account" class="form-input" placeholder="e.g. work, personal">
+        <label>Account Name <span style="font-weight:400;color:var(--text2)">(required)</span></label>
+        <input type="text" name="account" class="form-input" placeholder="e.g. work, personal" required>
       </div>
       <div id="creds-fields">
         <div class="form-row creds-field-row">
@@ -1501,6 +1505,8 @@ async def user_set_credentials(request: Request) -> Response:
 
     if not plugin:
         return RedirectResponse("/dash?flash=error&msg=Missing+plugin", status_code=302)
+    if not account:
+        return RedirectResponse("/dash?flash=error&msg=Account+name+is+required", status_code=302)
 
     if not key.get("is_admin"):
         perms = auth.get_key_permissions(key_id)
@@ -1512,17 +1518,13 @@ async def user_set_credentials(request: Request) -> Response:
         k = form.get(f"cred_key_{i}", "").strip()
         v = form.get(f"cred_val_{i}", "").strip()
         if k and v:
-            if account:
-                creds[f"{account}.{k}"] = v
-            else:
-                creds[k] = v
+            creds[f"{account}.{k}"] = v
 
     if not creds:
         return RedirectResponse("/dash?flash=error&msg=No+credentials+provided", status_code=302)
 
     auth.upsert_credentials(key_id, plugin, creds)
-    label = f"{plugin}/{account}" if account else plugin
-    return RedirectResponse(f"/dash?flash=success&msg=Credentials+saved+for+{label}", status_code=302)
+    return RedirectResponse(f"/dash?flash=success&msg=Added+{account}+account+for+{plugin}", status_code=302)
 
 
 async def user_remove_credentials(request: Request) -> Response:
@@ -1532,14 +1534,18 @@ async def user_remove_credentials(request: Request) -> Response:
     key_id = key["id"]
     form = await request.form()
     plugin = form.get("plugin", "").strip()
-    if not plugin:
-        return RedirectResponse("/dash?flash=error&msg=Missing+plugin", status_code=302)
+    account = form.get("account", "").strip()
+    if not plugin or not account:
+        return RedirectResponse("/dash?flash=error&msg=Missing+plugin+or+account", status_code=302)
 
     conn = _db()
-    conn.execute("DELETE FROM key_credentials WHERE key_id = ? AND plugin = ?", (key_id, plugin))
+    conn.execute(
+        "DELETE FROM key_credentials WHERE key_id = ? AND plugin = ? AND credential_key LIKE ?",
+        (key_id, plugin, f"{account}.%"),
+    )
     conn.commit()
     conn.close()
-    return RedirectResponse(f"/dash?flash=success&msg=Removed+{plugin}+credentials", status_code=302)
+    return RedirectResponse(f"/dash?flash=success&msg=Removed+{account}+from+{plugin}", status_code=302)
 
 
 async def admin_add_external(request: Request) -> Response:
