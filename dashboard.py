@@ -929,6 +929,102 @@ def _render_dashboard(key_info: dict, request: Request) -> HTMLResponse:
     plugins_html = f"""<div class="section-title">Plugins</div>
 <div class="plugin-grid">{''.join(plugin_cards)}</div>""" if plugin_cards else ""
 
+    # My Accounts section (non-admin users can manage their own credentials)
+    accounts_html = ""
+    if not is_admin:
+        flash_qs = request.query_params.get("flash", "")
+        flash_msg = request.query_params.get("msg", "")
+        flash_html = ""
+        if flash_qs and flash_msg:
+            flash_cls = "flash-success" if flash_qs == "success" else "flash-error"
+            flash_html = f'<div class="{flash_cls}">{escape(flash_msg)}</div>'
+
+        accessible_plugins = sorted(perms.keys())
+        account_rows = []
+        for pname in accessible_plugins:
+            pcreds = creds_all.get(pname, {})
+            cred_keys = sorted(pcreds.keys())
+            accounts_list: list[str] = []
+            seen_accts: set[str] = set()
+            bare_keys: list[str] = []
+            for k in cred_keys:
+                if "." in k:
+                    acct = k.split(".")[0]
+                    if acct not in seen_accts:
+                        accounts_list.append(acct)
+                        seen_accts.add(acct)
+                else:
+                    bare_keys.append(k)
+
+            status = '<span class="status-ok">configured</span>' if cred_keys else '<span style="color:var(--text2)">not configured</span>'
+            acct_tags = ""
+            if accounts_list:
+                acct_tags = " ".join(f'<span class="account-tag">{escape(a)}</span>' for a in accounts_list[:8])
+            elif bare_keys:
+                acct_tags = '<span class="account-tag">default</span>'
+
+            account_rows.append(f"""<tr>
+  <td class="mono">{escape(pname)}</td>
+  <td>{status}</td>
+  <td>{acct_tags}</td>
+  <td style="white-space:nowrap">
+    <button class="btn btn-ghost btn-sm" onclick="openCredsModal('{escape(pname)}')">Configure</button>
+    {f'<form method="POST" action="/dash/credentials/remove" style="display:inline" onsubmit="return confirm(\\x27Remove all {escape(pname)} credentials?\\x27)"><input type="hidden" name="plugin" value="{escape(pname)}"><button type="submit" class="btn btn-ghost btn-sm" style="color:var(--error)">Remove</button></form>' if cred_keys else ''}
+  </td>
+</tr>""")
+
+        creds_modal = f"""<div class="modal-backdrop" id="creds-modal">
+  <div class="modal">
+    <h2>Configure: <span id="creds-plugin-title" class="mono"></span></h2>
+    <form method="POST" action="/dash/credentials/set">
+      <input type="hidden" name="plugin" id="creds-plugin-name">
+      <div class="form-group">
+        <label>Account Name <span style="font-weight:400;color:var(--text2)">(leave blank for default/single-account)</span></label>
+        <input type="text" name="account" class="form-input" placeholder="e.g. work, personal">
+      </div>
+      <div id="creds-fields">
+        <div class="form-row creds-field-row">
+          <div class="form-group" style="flex:1"><label>Key</label><input type="text" name="cred_key_0" class="form-input" placeholder="api_key"></div>
+          <div class="form-group" style="flex:2"><label>Value</label><input type="text" name="cred_val_0" class="form-input" placeholder="sk-..."></div>
+        </div>
+      </div>
+      <button type="button" class="btn btn-ghost btn-sm" onclick="addCredField()" style="margin-bottom:12px">+ Add field</button>
+      <div class="help">Common keys: api_key, client_id, client_secret, refresh_token, base_url, bot_token</div>
+      <div class="form-actions">
+        <button type="button" class="btn btn-ghost" onclick="closeModal('creds-modal')">Cancel</button>
+        <button type="submit" class="btn btn-primary">Save</button>
+      </div>
+    </form>
+  </div>
+</div>"""
+
+        creds_js = """<script>
+var _credFieldCount=1;
+function openCredsModal(plugin){
+  document.getElementById('creds-plugin-title').textContent=plugin;
+  document.getElementById('creds-plugin-name').value=plugin;
+  _credFieldCount=1;
+  document.getElementById('creds-fields').innerHTML='<div class="form-row creds-field-row"><div class="form-group" style="flex:1"><label>Key</label><input type="text" name="cred_key_0" class="form-input" placeholder="api_key"></div><div class="form-group" style="flex:2"><label>Value</label><input type="text" name="cred_val_0" class="form-input" placeholder="sk-..."></div></div>';
+  document.getElementById('creds-modal').classList.add('open');
+}
+function addCredField(){
+  var i=_credFieldCount++;
+  var html='<div class="form-row creds-field-row"><div class="form-group" style="flex:1"><input type="text" name="cred_key_'+i+'" class="form-input" placeholder="key"></div><div class="form-group" style="flex:2"><input type="text" name="cred_val_'+i+'" class="form-input" placeholder="value"></div></div>';
+  document.getElementById('creds-fields').insertAdjacentHTML('beforeend',html);
+}
+</script>"""
+
+        accounts_html = f"""{flash_html}
+<div class="section-title">My Accounts</div>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Plugin</th><th>Status</th><th>Accounts</th><th></th></tr></thead>
+<tbody>{''.join(account_rows)}</tbody>
+</table>
+</div>
+{creds_modal}
+{creds_js}"""
+
     activity_html = f"""<div class="section-title">Recent Activity</div>
 {_activity_table(activity, show_key=is_admin)}
 {_pagination_html(page, per_page, total_activity, "/dash")}"""
@@ -937,6 +1033,7 @@ def _render_dashboard(key_info: dict, request: Request) -> HTMLResponse:
 <div class="container">
 {stats_html}
 {plugins_html}
+{accounts_html}
 {activity_html}
 </div>
 {_footer_html()}
@@ -1393,6 +1490,58 @@ def _render_audit_detail(key_info: dict, entry: dict) -> HTMLResponse:
 
 # ── Route list ────────────────────────────────────────────────────────────────
 
+async def user_set_credentials(request: Request) -> Response:
+    key = _get_key_from_cookie(request)
+    if not key:
+        return RedirectResponse("/dash/login", status_code=302)
+    key_id = key["id"]
+    form = await request.form()
+    plugin = form.get("plugin", "").strip()
+    account = form.get("account", "").strip()
+
+    if not plugin:
+        return RedirectResponse("/dash?flash=error&msg=Missing+plugin", status_code=302)
+
+    if not key.get("is_admin"):
+        perms = auth.get_key_permissions(key_id)
+        if plugin not in perms:
+            return RedirectResponse(f"/dash?flash=error&msg=No+access+to+{plugin}", status_code=302)
+
+    creds: dict[str, str] = {}
+    for i in range(20):
+        k = form.get(f"cred_key_{i}", "").strip()
+        v = form.get(f"cred_val_{i}", "").strip()
+        if k and v:
+            if account:
+                creds[f"{account}.{k}"] = v
+            else:
+                creds[k] = v
+
+    if not creds:
+        return RedirectResponse("/dash?flash=error&msg=No+credentials+provided", status_code=302)
+
+    auth.upsert_credentials(key_id, plugin, creds)
+    label = f"{plugin}/{account}" if account else plugin
+    return RedirectResponse(f"/dash?flash=success&msg=Credentials+saved+for+{label}", status_code=302)
+
+
+async def user_remove_credentials(request: Request) -> Response:
+    key = _get_key_from_cookie(request)
+    if not key:
+        return RedirectResponse("/dash/login", status_code=302)
+    key_id = key["id"]
+    form = await request.form()
+    plugin = form.get("plugin", "").strip()
+    if not plugin:
+        return RedirectResponse("/dash?flash=error&msg=Missing+plugin", status_code=302)
+
+    conn = _db()
+    conn.execute("DELETE FROM key_credentials WHERE key_id = ? AND plugin = ?", (key_id, plugin))
+    conn.commit()
+    conn.close()
+    return RedirectResponse(f"/dash?flash=success&msg=Removed+{plugin}+credentials", status_code=302)
+
+
 async def admin_add_external(request: Request) -> Response:
     key = _get_key_from_cookie(request)
     if not key or not key.get("is_admin"):
@@ -1456,6 +1605,8 @@ def get_dashboard_routes() -> list[Route]:
         Route("/dash/admin/keys/create", admin_create_key, methods=["POST"]),
         Route("/dash/admin/keys/edit", admin_edit_key, methods=["POST"]),
         Route("/dash/admin/keys/delete", admin_delete_key, methods=["POST"]),
+        Route("/dash/credentials/set", user_set_credentials, methods=["POST"]),
+        Route("/dash/credentials/remove", user_remove_credentials, methods=["POST"]),
         Route("/dash/admin/external/add", admin_add_external, methods=["POST"]),
         Route("/dash/admin/external/remove", admin_remove_external, methods=["POST"]),
         Route("/dash/admin/external/refresh", admin_refresh_external, methods=["POST"]),
