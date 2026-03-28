@@ -4,15 +4,19 @@ A unified MCP (Model Context Protocol) gateway that aggregates multiple MCP serv
 
 Connect your AI agents to dozens of services through one URL, one API key, one audit trail.
 
-## Why
+## Why We Built This
 
-MCP is great, but managing multiple MCP servers is painful:
-- Each server needs its own auth setup
-- No centralized audit trail or rate limiting
-- Agents need separate connections to each server
-- No way to control which agent can access which tools
+We run AI agents across dozens of environments — Cursor, Claude Desktop, Opencode, custom bots. Every environment needs its own MCP connections, its own auth, its own config. It breaks constantly and scales terribly. Here's what drove us to build this:
 
-uni-mcp-gateway solves this by acting as a middleware layer between your agents and your tools.
+**Re-auth hell.** Every time you add a new IDE, a new agent, or a new machine, you re-authenticate every MCP server from scratch. With a gateway, you authenticate once. Every environment just needs one URL and one API key.
+
+**Context window bloat.** Connect 5 MCP servers with 50 tools each and your agent's context window is stuffed with 250 tool schemas before it even starts working. The gateway's meta-tool architecture (`list_plugins` → `search_tools` → `get_tool_schema` → `call_tool`) means only 4 tools in context, always. Agents discover what they need on demand.
+
+**Multi-account chaos.** Need two Slack workspaces? Three Calendly accounts? Five email inboxes? Without a gateway, that's 10 separate MCP servers with 10x the tools. The gateway handles multi-account natively — one plugin, one set of tools, pass `account="work"` or `account="personal"`.
+
+**Agents don't need API docs.** The gateway doubles as a REST API bridge. Any tool is callable via `POST /api/v1/call`. No Swagger specs, no SDK setup — agents (and scripts) just call tools by name with JSON params. The gateway is the API.
+
+**Audit and access control, finally.** Share API keys with people or agents and know exactly what they did. Every tool call is logged with full request, response, duration, and caller. Set granular scopes — this key can read Slack but not send, can access the "work" Calendly but not "personal", can call `gmail_messages_list` 30 times per minute but `gmail_messages_send` only 5.
 
 ## Features
 
