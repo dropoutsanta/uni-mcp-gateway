@@ -761,11 +761,12 @@ async def admin_edit_key(request: Request) -> Response:
     rate_limit = int(form.get("rate_limit", "100") or "100")
     expires_at = form.get("expires_at", "").strip() or None
     allowed_ips = form.get("allowed_ips", "").strip() or None
+    can_audit = 1 if form.get("can_audit") else 0
 
     conn = _db()
     conn.execute(
-        "UPDATE keys SET label=?, rate_limit=?, expires_at=?, allowed_ips=? WHERE id=?",
-        (label, rate_limit, expires_at, allowed_ips, target_key_id),
+        "UPDATE keys SET label=?, rate_limit=?, expires_at=?, allowed_ips=?, can_audit=? WHERE id=?",
+        (label, rate_limit, expires_at, allowed_ips, can_audit, target_key_id),
     )
     conn.commit()
     conn.close()
@@ -883,10 +884,15 @@ def _render_login(error: str = "") -> HTMLResponse:
 
 def _render_dashboard(key_info: dict, request: Request) -> HTMLResponse:
     is_admin = bool(key_info.get("is_admin"))
+    can_audit = bool(key_info.get("can_audit", 1))
     key_id = key_info["id"]
-    stats = _get_stats(key_id, is_admin)
+    stats = _get_stats(key_id, is_admin) if (is_admin or can_audit) else {"total": 0, "today": 0, "week": 0, "error_rate": 0}
     page, per_page, offset = _paginate(request, default_per_page=50)
-    activity, total_activity = _get_recent_activity(key_id, is_admin, limit=per_page, offset=offset)
+    activity, total_activity = (
+        _get_recent_activity(key_id, is_admin, limit=per_page, offset=offset)
+        if (is_admin or can_audit)
+        else ([], 0)
+    )
     perms = auth.get_key_permissions(key_id)
 
     stats_html = f"""<div class="stat-grid">
@@ -1029,9 +1035,12 @@ function addCredField(){
 {creds_modal}
 {creds_js}"""
 
-    activity_html = f"""<div class="section-title">Recent Activity</div>
+    if is_admin or can_audit:
+        activity_html = f"""<div class="section-title">Recent Activity</div>
 {_activity_table(activity, show_key=is_admin)}
 {_pagination_html(page, per_page, total_activity, "/dash")}"""
+    else:
+        activity_html = ""
 
     body = f"""{_header_html(key_info, 'dashboard')}
 <div class="container">
@@ -1089,6 +1098,7 @@ def _render_admin(key_info: dict, request: Request) -> HTMLResponse:
             "rate_limit": krate,
             "expires_at": k.get("expires_at") or "",
             "allowed_ips": k.get("allowed_ips") or "",
+            "can_audit": bool(k.get("can_audit", 1)),
             "permissions": perm_levels,
             "granular_limits": granular_limits,
         })
@@ -1175,6 +1185,9 @@ def _render_admin(key_info: dict, request: Request) -> HTMLResponse:
         <div class="form-group"><label>Expiry (ISO date)</label><input type="text" name="expires_at" id="edit-expires"></div>
       </div>
       <div class="form-group"><label>Allowed IPs</label><input type="text" name="allowed_ips" id="edit-ips"></div>
+      <div class="form-group">
+        <div class="toggle-row"><input type="checkbox" name="can_audit" id="edit-can-audit" value="1" checked><label for="edit-can-audit">Can audit own activity</label></div>
+      </div>
       <div class="form-group"><label>Plugin Permissions</label>{edit_plugins}</div>
       <div class="form-group" style="border-top:1px solid var(--border);padding-top:16px;margin-top:8px">
         <label>Granular Rate Limits <span style="font-weight:400;color:var(--text2)">(per plugin / account / tool)</span></label>
@@ -1308,6 +1321,7 @@ function openEditModal(data){
   document.getElementById('edit-rate-limit').value=data.rate_limit||100;
   document.getElementById('edit-expires').value=data.expires_at||'';
   document.getElementById('edit-ips').value=data.allowed_ips||'';
+  document.getElementById('edit-can-audit').checked=data.can_audit!==false;
   var allPlugins=""" + json.dumps(_all_plugins) + """;
   allPlugins.forEach(function(p){
     var sel=document.getElementById('edit_perm_'+p);

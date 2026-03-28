@@ -937,6 +937,30 @@ def gateway_audit_log(
 
 
 @mcp.tool()
+def gateway_my_audit_log(
+    plugin: Optional[str] = None,
+    tool_name: Optional[str] = None,
+    limit: int = 50,
+) -> list[dict]:
+    """View your own activity log. Shows only calls made by your key.
+
+    Args:
+        plugin: Filter by plugin name
+        tool_name: Filter by tool name
+        limit: Max results (default 50)
+    """
+    ctx = _current_context.get()
+    if not ctx:
+        return [{"error": "No request context"}]
+    conn = auth._get_db()
+    row = conn.execute("SELECT can_audit FROM keys WHERE id = ?", (ctx.key_id,)).fetchone()
+    conn.close()
+    if not row or not row["can_audit"]:
+        return [{"error": "Audit access is disabled for your key"}]
+    return audit.query_audit_log(key_id=ctx.key_id, plugin=plugin, tool_name=tool_name, limit=limit)
+
+
+@mcp.tool()
 def gateway_plugin_health() -> dict:
     """Check health of all plugin upstream dependencies. Admin only."""
     ctx = _current_context.get()
@@ -1484,6 +1508,7 @@ _SELF_SERVICE_TOOLS = {
     "gateway_add_own_account",
     "gateway_list_own_credentials",
     "gateway_remove_own_account",
+    "gateway_my_audit_log",
 }
 
 
@@ -1491,6 +1516,11 @@ def _is_mcp_tool_visible(tool_name: str, ctx: RequestContext) -> bool:
     """Filter the MCP-level tool listing (meta-tools + admin tools)."""
     if ctx.is_admin:
         return True
+    if tool_name == "gateway_my_audit_log":
+        conn = auth._get_db()
+        row = conn.execute("SELECT can_audit FROM keys WHERE id = ?", (ctx.key_id,)).fetchone()
+        conn.close()
+        return bool(row and row["can_audit"])
     if tool_name in _SELF_SERVICE_TOOLS:
         return True
     if tool_name.startswith("gateway_"):

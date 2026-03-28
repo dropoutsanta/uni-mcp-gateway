@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS keys (
     rate_limit INTEGER DEFAULT 100,
     expires_at TEXT,
     allowed_ips TEXT,
+    can_audit INTEGER DEFAULT 1,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -79,6 +80,10 @@ def _get_db() -> sqlite3.Connection:
 def init_db() -> None:
     conn = _get_db()
     conn.executescript(_SCHEMA)
+    # Migration: add can_audit column if missing
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(keys)").fetchall()]
+    if "can_audit" not in cols:
+        conn.execute("ALTER TABLE keys ADD COLUMN can_audit INTEGER DEFAULT 1")
     conn.commit()
     conn.close()
     _ensure_admin_key()
@@ -324,7 +329,9 @@ def delete_key(key_id: str) -> dict:
 
 def list_keys() -> list[dict]:
     conn = _get_db()
-    rows = conn.execute("SELECT id, label, is_admin, rate_limit, expires_at, allowed_ips, created_at FROM keys").fetchall()
+    rows = conn.execute(
+        "SELECT id, label, is_admin, rate_limit, expires_at, allowed_ips, can_audit, created_at FROM keys"
+    ).fetchall()
     conn.close()
     result = []
     for r in rows:
