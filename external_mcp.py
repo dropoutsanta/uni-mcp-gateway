@@ -18,7 +18,7 @@ import requests
 
 from plugin_base import MCPPlugin, ToolDef
 
-_DB_PATH = os.environ.get("GATEWAY_DB_PATH", "/data/gateway.db")
+_DB_PATH = os.environ.get("GATEWAY_DB", "/data/gateway.db")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS external_mcps (
@@ -185,65 +185,86 @@ class ExternalMCPConnection:
             raise
 
     def discover_tools(self) -> dict[str, dict]:
-        """Call tools/list and return {tool_name: schema}."""
+        """Call tools/list and return {tool_name: schema}. Retries once on session expiry."""
         if not self.initialized:
             self.initialize()
 
-        try:
-            result, sid = _mcp_request(
-                self.url, "tools/list",
-                headers=self._headers(),
-                session_id=self.session_id,
-            )
-            if sid:
-                self.session_id = sid
+        for attempt in range(2):
+            try:
+                result, sid = _mcp_request(
+                    self.url, "tools/list",
+                    headers=self._headers(),
+                    session_id=self.session_id,
+                )
+                if sid:
+                    self.session_id = sid
 
-            raw_tools = result.get("tools", []) if result else []
-            self.tools = {}
-            for t in raw_tools:
-                self.tools[t["name"]] = {
-                    "name": t["name"],
-                    "description": t.get("description", ""),
-                    "inputSchema": t.get("inputSchema", {}),
-                }
-            self.last_error = None
-            return self.tools
-        except Exception as exc:
-            self.last_error = str(exc)
-            raise
+                raw_tools = result.get("tools", []) if result else []
+                self.tools = {}
+                for t in raw_tools:
+                    self.tools[t["name"]] = {
+                        "name": t["name"],
+                        "description": t.get("description", ""),
+                        "inputSchema": t.get("inputSchema", {}),
+                    }
+                self.last_error = None
+                return self.tools
+            except Exception as exc:
+                if attempt == 0 and self._is_session_error(exc):
+                    self.initialized = False
+                    self.session_id = None
+                    self.initialize()
+                    continue
+                self.last_error = str(exc)
+                raise
+
+    def _extract_result(self, result: Any) -> Any:
+        if result and isinstance(result, dict):
+            content = result.get("content", [])
+            if isinstance(content, list) and len(content) == 1 and content[0].get("type") == "text":
+                text = content[0].get("text", "")
+                try:
+                    return json.loads(text)
+                except (json.JSONDecodeError, TypeError):
+                    return text
+            if isinstance(content, list):
+                texts = [c.get("text", "") for c in content if c.get("type") == "text"]
+                return "\n".join(texts) if texts else result
+        return result
+
+    def _is_session_error(self, exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return "session not found" in msg or "session expired" in msg or "invalid session" in msg
 
     def call_tool(self, tool_name: str, arguments: dict) -> Any:
-        """Proxy a tool call to the external server."""
+        """Proxy a tool call to the external server. Retries once on session expiry."""
         if not self.initialized:
             self.initialize()
 
-        try:
-            result, sid = _mcp_request(
-                self.url, "tools/call",
-                params={"name": tool_name, "arguments": arguments},
-                headers=self._headers(),
-                session_id=self.session_id,
-                timeout=120,
-            )
-            if sid:
-                self.session_id = sid
-
-            if result and isinstance(result, dict):
-                content = result.get("content", [])
-                if isinstance(content, list) and len(content) == 1 and content[0].get("type") == "text":
-                    text = content[0].get("text", "")
+        for attempt in range(2):
+            try:
+                result, sid = _mcp_request(
+                    self.url, "tools/call",
+                    params={"name": tool_name, "arguments": arguments},
+                    headers=self._headers(),
+                    session_id=self.session_id,
+                    timeout=120,
+                )
+                if sid:
+                    self.session_id = sid
+                return self._extract_result(result)
+            except Exception as exc:
+                if attempt == 0 and self._is_session_error(exc):
+                    self.initialized = False
+                    self.session_id = None
                     try:
-                        return json.loads(text)
-                    except (json.JSONDecodeError, TypeError):
-                        return text
-                if isinstance(content, list):
-                    texts = [c.get("text", "") for c in content if c.get("type") == "text"]
-                    return "\n".join(texts) if texts else result
-
-            return result
-        except Exception as exc:
-            self.last_error = str(exc)
-            return {"error": f"External MCP call failed: {exc}"}
+                        self.initialize()
+                        continue
+                    except Exception as init_exc:
+                        self.last_error = str(init_exc)
+                        return {"error": f"Re-init failed: {init_exc}"}
+                self.last_error = str(exc)
+                return {"error": f"External MCP call failed: {exc}"}
 
 
 # ── Connection cache ─────────────────────────────────────────────────────────

@@ -97,7 +97,7 @@ def _load_receipt_id(track_id: str) -> str | None:
 
 def _webhook_url_for(receipt_id: str) -> str:
     """Generate the MCP gateway webhook URL for a given receipt ID."""
-    base = os.environ.get("MCP_BASE_URL", "").rstrip("/")
+    base = os.environ.get("MCP_BASE_URL", "https://shitty-agent-gateway-27.fly.dev").rstrip("/")
     return f"{base}/webhook/{receipt_id}"
 
 
@@ -127,13 +127,13 @@ class AiArkPlugin(MCPPlugin):
             "search_companies": ToolDef(
                 access="read",
                 handler=self.search_companies,
-                description="Search 69M+ enriched company profiles. Returns company data instantly (no polling needed). Results include: name, domain, industry, location, employee count, revenue, technologies, LinkedIn URL, logo, and description.",
+                description="0.5 CREDITS PER RESULT. Search 69M+ enriched company profiles. Returns company data instantly (no polling needed). Results include: name, domain, industry, location, employee count, revenue, technologies, LinkedIn URL, logo, and description.",
             ),
             "search_people": ToolDef(
                 access="read",
                 handler=self.search_people,
                 description=(
-                    "Search 400M+ people profiles. Returns up to 100 profiles per call\n"
+                    "0.5 CREDITS PER RESULT. Search 400M+ people profiles. Returns up to 100 profiles per call\n"
                     "(no polling). Does NOT include email addresses — use\n"
                     "export_people_with_email to get emails.\n\n"
                     "For larger result sets, parallelize with page offsets (page=0,\n"
@@ -161,22 +161,22 @@ class AiArkPlugin(MCPPlugin):
             "reverse_people_lookup": ToolDef(
                 access="write",
                 handler=self.reverse_people_lookup,
-                description="Look up a person by email or phone number. Returns full profile instantly.",
+                description="1 CREDIT. Look up a person by email or phone number. Returns full profile instantly.",
             ),
             "find_mobile_phone": ToolDef(
                 access="write",
                 handler=self.find_mobile_phone,
-                description="Find mobile phone numbers for a person by LinkedIn URL or company domain + name.",
+                description="1 CREDIT. Find mobile phone numbers for a person by LinkedIn URL or company domain + name.",
             ),
             "analyze_personality": ToolDef(
                 access="write",
                 handler=self.analyze_personality,
-                description="Analyze a person's personality from their LinkedIn. Returns DISC, OCEAN, archetype, selling tips.",
+                description="1 CREDIT. Analyze a person's personality from their LinkedIn. Returns DISC, OCEAN, archetype, selling tips.",
             ),
             "find_emails_by_track_id": ToolDef(
                 access="write",
                 handler=self.find_emails_by_track_id,
-                description="Find verified emails for people from a previous search_people trackId. Poll get_export_results for results.",
+                description="1 CREDIT PER PERSON. Find verified emails for people from a previous search_people trackId. Poll get_export_results for results.",
             ),
             "get_email_statistics": ToolDef(
                 access="read",
@@ -467,13 +467,14 @@ class AiArkPlugin(MCPPlugin):
                 "   your filters. It returns totalElements (the total count) and 1\n"
                 "   sample profile. This is FREE — no email credits consumed.\n\n"
                 "2. CREDIT COSTS\n"
-                "   - search_people: FREE (no email credits, profiles only)\n"
+                "   - search_people: 0.5 CREDITS PER RESULT (profiles only, no emails)\n"
+                "   - search_companies: 0.5 CREDITS PER RESULT\n"
                 "   - test_search_people: 0.5 CREDITS (returns count + 1 sample)\n"
-                "   - search_companies: FREE\n"
                 "   - export_people_with_email: 1 CREDIT PER PERSON exported\n"
-                "   - reverse_people_lookup: 1 credit per lookup\n"
-                "   - find_mobile_phone: 1 credit per lookup\n"
-                "   - analyze_personality: 1 credit per analysis\n"
+                "   - find_emails_by_track_id: 1 CREDIT PER PERSON\n"
+                "   - reverse_people_lookup: 1 CREDIT per lookup\n"
+                "   - find_mobile_phone: 1 CREDIT per lookup\n"
+                "   - analyze_personality: 1 CREDIT per analysis\n"
                 "   Check balance with get_credits.\n\n"
                 "3. SIZE LIMITS\n"
                 "   All tools are capped at 100 results per call. For larger sets,\n"
@@ -703,7 +704,33 @@ class AiArkPlugin(MCPPlugin):
         return result
 
     def get_email_statistics(self, track_id: str) -> dict:
-        return self._ark_request("GET", f"/v1/people/statistics/{track_id}")
+        stats = self._ark_request("GET", f"/v1/people/statistics/{track_id}")
+        if "error" in stats and "401" in str(stats.get("error", "")):
+            receipt_id = _load_receipt_id(track_id)
+            if receipt_id:
+                result_path = _RESULTS_DIR / f"{receipt_id}.json"
+                if result_path.exists():
+                    try:
+                        data = json.loads(result_path.read_text())
+                        people = data.get("data", [])
+                        valid = sum(
+                            1 for p in people
+                            for e in p.get("email", {}).get("output", [])
+                            if e.get("status") == "VALID"
+                        )
+                        return {
+                            "state": "DONE",
+                            "statistics": {"total": len(people), "found": valid},
+                            "_source": "webhook_cache",
+                        }
+                    except Exception:
+                        pass
+            return {
+                "status": "awaiting_webhook",
+                "message": "Statistics endpoint unavailable (upstream auth change). Results will arrive via webhook — poll get_export_results in 15-30s.",
+                "track_id": track_id,
+            }
+        return stats
 
     def get_export_results(self, track_id: str) -> dict:
         receipt_id = _load_receipt_id(track_id)
@@ -716,7 +743,14 @@ class AiArkPlugin(MCPPlugin):
                     return {"error": f"Failed to read results: {exc}"}
 
         stats = self._ark_request("GET", f"/v1/people/statistics/{track_id}")
+
         if "error" in stats:
+            if "401" in str(stats.get("error", "")):
+                return {
+                    "status": "awaiting_webhook",
+                    "message": "Statistics endpoint unavailable (upstream auth change). Results arrive via webhook — poll this tool again in 15-30 seconds.",
+                    "track_id": track_id,
+                }
             return stats
 
         state = stats.get("state", "UNKNOWN")

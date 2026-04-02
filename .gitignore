@@ -13,3 +13,5 @@ node_modules/
 *.egg-info/
 dist/
 build/
+.playwright-cli/
+fly.toml
