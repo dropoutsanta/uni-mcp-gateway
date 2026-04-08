@@ -222,10 +222,13 @@ def _handle_socket_event(client: SocketModeClient, req: SocketModeRequest) -> No
 
     def _bg() -> None:
         try:
+            print(f"[coldmessage] starting work: {text!r}", flush=True)
             result = _do_smartscout_work(text)
-            httpx.post(response_url, json=result, timeout=30)
+            print(f"[coldmessage] work done, posting to response_url", flush=True)
+            resp = httpx.post(response_url, json=result, timeout=30)
+            print(f"[coldmessage] posted to Slack: {resp.status_code}", flush=True)
         except Exception:
-            logger.error("coldmessage bg error:\n%s", traceback.format_exc())
+            print(f"[coldmessage] BG ERROR:\n{traceback.format_exc()}", flush=True)
             try:
                 httpx.post(
                     response_url,
@@ -241,16 +244,16 @@ def _handle_socket_event(client: SocketModeClient, req: SocketModeRequest) -> No
 def _start_socket_mode() -> None:
     app_token = os.environ.get("SLACK_APP_TOKEN", "")
     if not app_token:
-        logger.warning("[coldmessage] SLACK_APP_TOKEN not set — Socket Mode disabled")
+        print("[coldmessage] SLACK_APP_TOKEN not set — Socket Mode disabled", flush=True)
         return
 
     try:
         sm_client = SocketModeClient(app_token=app_token)
         sm_client.socket_mode_request_listeners.append(_handle_socket_event)
         sm_client.connect()
-        logger.info("[coldmessage] Socket Mode connected")
+        print("[coldmessage] Socket Mode connected successfully", flush=True)
     except Exception:
-        logger.error("[coldmessage] Socket Mode failed:\n%s", traceback.format_exc())
+        print(f"[coldmessage] Socket Mode FAILED:\n{traceback.format_exc()}", flush=True)
 
 
 # ── Plugin definition ────────────────────────────────────────────────────────
