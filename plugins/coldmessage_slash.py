@@ -223,4 +223,4 @@ class ColdMessageSlashPlugin(MCPPlugin):
     tools: dict[str, ToolDef] = {}
 
     def extra_routes(self) -> list[Route]:
-        return [Route("/webhook/coldmessage", endpoint=handle_coldmessage, methods=["POST"])]
+        return [Route("/slack/coldmessage", endpoint=handle_coldmessage, methods=["POST"])]

@@ -1225,6 +1225,7 @@ _PUBLIC_PREFIXES = (
     "/health",
     "/dash",
     "/webhook/",
+    "/slack/",
     "/media/",
 )
 
