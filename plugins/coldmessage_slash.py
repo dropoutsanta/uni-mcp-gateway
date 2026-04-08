@@ -140,21 +140,19 @@ def _format_report(report: dict) -> dict:
 def _do_smartscout_work(query: str) -> dict:
     _set_admin_context()
 
-    if query.lower().startswith("report "):
-        brand_id_str = query[7:].strip()
-        try:
-            brand_id = int(brand_id_str)
-        except ValueError:
-            return {
-                "response_type": "ephemeral",
-                "text": f"Invalid brand ID: `{brand_id_str}`. Use a numeric ID from search results.",
-            }
+    search_term = query[7:].strip() if query.lower().startswith("report ") else query
+
+    # If it's a numeric ID, go straight to report
+    try:
+        brand_id = int(search_term)
         report = _ss.brand_report(brand_id=brand_id)
         if isinstance(report, dict) and "error" in report:
             return {"response_type": "in_channel", "text": f"SmartScout error: {report['error']}"}
         return _format_report(report)
+    except ValueError:
+        pass
 
-    result = _ss.search_brands(name=query)
+    result = _ss.search_brands(name=search_term)
     if isinstance(result, dict) and "error" in result:
         return {"response_type": "in_channel", "text": f"SmartScout error: {result['error']}"}
 
