@@ -29,7 +29,7 @@ from plugins.smartscout import SmartScoutPlugin
 
 logger = logging.getLogger(__name__)
 
-ALLOWED_CHANNELS = {"C0A5KV5QQ6S"}
+ALLOWED_CHANNELS = {"C0A5KV5QQ6S", "C0A5RG2HJVA"}
 
 _ss = SmartScoutPlugin()
 
