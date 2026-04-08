@@ -148,24 +148,33 @@ def _format_full_report(report: dict) -> dict:
     # Revenue trend
     if history and history.get("samples"):
         samples = history["samples"]
-        lines.append(f"\n*Revenue Trend* ({history.get('total_weeks', '?')} weeks of data):")
+        lines.append(f"\n*Revenue Trend* ({history.get('total_weeks', '?')} wks):")
         for s in samples[-6:]:
-            lines.append(f"  {s.get('date', '?')}  —  {_money(s.get('revenue'))}/wk  ·  {s.get('asins', '?')} ASINs")
+            rev = s.get("revenue")
+            if rev is not None:
+                lines.append(f"  {s.get('date', '?')}  —  {_money(rev)}/wk  ·  {s.get('asins', '?')} ASINs")
 
-    # Top products with detail
+    # Top products
     if products:
         lines.append("\n*Top Products:*")
         for i, p in enumerate(products[:5], 1):
             title = (p.get("title") or "")[:55]
             prev = _money(p.get("revenue"))
-            rank = p.get("rank") or "—"
+            rank = p.get("rank")
+            rank_str = f"Rank #{rank}" if rank else "Unranked"
             sellers_ct = p.get("num_sellers") or "—"
             growth = _pct(p.get("mom_growth"))
-            bbp = f"${p.get('buybox_price', 0):.2f}" if p.get("buybox_price") else "—"
+            bbp = p.get("buybox_price")
+            bb_str = f"BB ${bbp:.2f}" if bbp else ""
+            detail_parts = [prev + "/mo", rank_str, f"{sellers_ct} sellers"]
+            if bb_str:
+                detail_parts.append(bb_str)
+            detail_parts.append(f"{growth} MoM")
             lines.append(f"{i}. *{title}*")
-            lines.append(f"    {prev}/mo  ·  Rank #{rank}  ·  {sellers_ct} sellers  ·  BB ${bbp}  ·  {growth} MoM")
+            lines.append(f"    {' · '.join(detail_parts)}")
 
-    # Per-product organic ranks & search terms
+    # Per-product deep dive
+    detail_map = {d.get("asin"): d for d in product_details}
     if product_details:
         lines.append("\n*Product Deep-Dive:*")
         for det in product_details[:3]:
@@ -174,52 +183,69 @@ def _format_full_report(report: dict) -> dict:
 
             ranks = det.get("organic_ranks", [])
             if ranks:
+                ranked = [r for r in ranks if r.get("rank") is not None]
+                unranked_terms = [r for r in ranks if r.get("rank") is None]
                 total = det.get("total_ranked_terms", len(ranks))
-                lines.append(f"  Organic ranks ({total} terms total, top 10):")
-                for r in ranks[:10]:
-                    term = r.get("term", "?")
-                    pos = r.get("rank", "?")
-                    vol = r.get("volume")
-                    vol_str = f"  ·  {vol:,} vol" if vol else ""
-                    lines.append(f"    #{pos} — _{term}_{vol_str}")
+
+                if ranked:
+                    lines.append(f"  Top organic ranks ({total} terms tracked):")
+                    for r in ranked[:10]:
+                        term = r.get("term", "?")
+                        pos = r.get("rank")
+                        vol = r.get("volume")
+                        vol_str = f" · {vol:,} vol" if vol else ""
+                        lines.append(f"    #{pos} _{term}_{vol_str}")
+                elif unranked_terms:
+                    top_terms = [r.get("term", "") for r in unranked_terms[:8] if r.get("term")]
+                    lines.append(f"  Tracked on {total} search terms (no current rank):")
+                    lines.append(f"    _{', '.join(top_terms)}_")
 
             bb = det.get("buybox_sellers", [])
             if bb:
-                lines.append(f"  Buy Box sellers:")
-                for s in bb[:5]:
+                bb_parts = []
+                for s in bb[:3]:
                     sname = s.get("seller") or "?"
-                    pct = f"{s.get('buybox_pct', 0):.0f}%" if s.get("buybox_pct") else "—"
+                    pct = s.get("buybox_pct")
+                    pct_str = f"{pct:.0f}%" if pct else "—"
                     fba = " (FBA)" if s.get("is_fba") else ""
-                    lines.append(f"    • {sname} — {pct} BB{fba}")
+                    bb_parts.append(f"{sname} {pct_str}{fba}")
+                lines.append(f"  Buy Box: {' | '.join(bb_parts)}")
 
     # Seller coverage
     if sellers:
         lines.append("\n*Seller Coverage:*")
-        for s in sellers[:7]:
+        for s in sellers[:5]:
             sname = s.get("name") or "?"
             srev = _money(s.get("revenue"))
             offers = s.get("offers") or "?"
-            pct = f"{s.get('brand_pct', 0):.0f}%" if s.get("brand_pct") else "—"
-            lines.append(f"• {sname}  —  {srev}/mo  ·  {offers} offers  ·  {pct} brand share")
+            pct = s.get("brand_pct")
+            pct_str = f" · {pct:.0f}% share" if pct else ""
+            lines.append(f"• {sname} — {srev}/mo · {offers} offers{pct_str}")
 
     # Competitors
-    if competitors and competitors.get("top_15"):
+    comp_list = competitors.get("top_15", []) if competitors else []
+    if comp_list:
         lines.append(f"\n*Competitors* (vs ASIN {competitors.get('for_asin', '?')}):")
-        for c in competitors["top_15"][:8]:
-            cname = c.get("brand") or "?"
-            ctitle = (c.get("title") or "")[:40]
+        for c in comp_list[:8]:
+            cname = c.get("brand") or ""
+            ctitle = (c.get("title") or "")[:45]
+            label = f"{cname} — {ctitle}" if cname else ctitle
             crev = _money(c.get("revenue"))
-            rel = f"{c.get('relevancy', 0):.0f}%" if c.get("relevancy") else ""
-            lines.append(f"• {cname} — {ctitle}  ·  {crev}/mo  {rel}")
+            rel = c.get("relevancy")
+            rel_str = f" · {rel:.0f}% match" if rel else ""
+            lines.append(f"• {label} · {crev}/mo{rel_str}")
 
-    # Subcategory landscape
-    if landscape and landscape.get("top_brands"):
-        lines.append(f"\n*Category Landscape* (SubCat `{landscape.get('subcategory_id')}`):")
-        for lb in landscape["top_brands"][:8]:
+    # Subcategory landscape — only show if there's actual data
+    lb_list = landscape.get("top_brands", []) if landscape else []
+    lb_with_data = [lb for lb in lb_list if lb.get("revenue") or lb.get("market_share")]
+    if lb_with_data:
+        lines.append(f"\n*Category Landscape:*")
+        for lb in lb_with_data[:8]:
             lname = lb.get("brand") or "?"
             lrev = _money(lb.get("revenue"))
-            share = f"{lb.get('market_share', 0):.1f}%" if lb.get("market_share") else ""
-            lines.append(f"• {lname}  —  {lrev}/wk  {share}")
+            share = lb.get("market_share")
+            share_str = f" · {share:.1f}% share" if share else ""
+            lines.append(f"• {lname} — {lrev}/wk{share_str}")
 
     return {"response_type": "in_channel", "text": "\n".join(lines)}
 
