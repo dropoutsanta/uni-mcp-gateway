@@ -86,11 +86,8 @@ def _format_search(brands: list[dict]) -> dict:
     return {"response_type": "in_channel", "text": "\n".join(lines)}
 
 
-def _format_report(report: dict) -> dict:
-    brand = report.get("brand", {})
-    products = report.get("products", [])
-    cats = report.get("category_breakdown", [])
-
+def _brand_header(brand: dict) -> list[str]:
+    """Common brand header lines used by both summary and full report."""
     name = brand.get("name", "Unknown")
     rev = _money(brand.get("monthlyRevenue"))
     units = f"{brand.get('monthlyUnitsSold', 0):,}" if brand.get("monthlyUnitsSold") else "N/A"
@@ -101,8 +98,8 @@ def _format_report(report: dict) -> dict:
     rating = brand.get("reviewRating", "—")
     total_prods = brand.get("totalProducts", "—")
     total_reviews = f"{brand.get('totalReviews', 0):,}" if brand.get("totalReviews") else "—"
-    storefront = brand.get("storefrontUrl", "")
     ad_spend = _money(brand.get("totalAdSpend"))
+    storefront = brand.get("storefrontUrl", "")
 
     lines = [
         f"*{name}*  (ID `{brand.get('id')}`)",
@@ -112,9 +109,17 @@ def _format_report(report: dict) -> dict:
         f"*Brand Score:* {score}  |  *Avg Price:* {avg_price}  |  *Rating:* {rating}",
         f"*Products:* {total_prods}  |  *Reviews:* {total_reviews}  |  *Ad Spend:* {ad_spend}",
     ]
-
     if storefront:
         lines.append(f"*Storefront:* {storefront}")
+    return lines
+
+
+def _format_summary(report: dict) -> dict:
+    """Quick summary — brand basics + top products list."""
+    brand = report.get("brand", {})
+    products = report.get("products", [])
+
+    lines = _brand_header(brand)
 
     if products:
         lines.append("\n*Top Products:*")
@@ -122,14 +127,99 @@ def _format_report(report: dict) -> dict:
             title = (p.get("title") or "")[:55]
             prev = _money(p.get("revenue"))
             rank = p.get("rank") or "—"
-            sellers = p.get("num_sellers") or "—"
-            lines.append(f"{i}. {title}  —  {prev}/mo  ·  Rank #{rank}  ·  {sellers} sellers")
+            lines.append(f"{i}. {title}  —  {prev}/mo  ·  Rank #{rank}")
 
-    if cats:
-        lines.append("\n*Category Breakdown:*")
-        for c in cats[:5]:
-            crev = _money(c.get("latest_revenue"))
-            lines.append(f"• SubCat `{c.get('subcategory_id')}`: {crev}/wk")
+    lines.append(f"\n_Use `/coldmessage report {brand.get('name', '')}` for the full dossier._")
+    return {"response_type": "in_channel", "text": "\n".join(lines)}
+
+
+def _format_full_report(report: dict) -> dict:
+    """Full dossier — everything SmartScout has."""
+    brand = report.get("brand", {})
+    products = report.get("products", [])
+    product_details = report.get("product_details", [])
+    sellers = report.get("sellers", [])
+    competitors = report.get("competitors", {})
+    landscape = report.get("subcategory_landscape", {})
+    history = report.get("revenue_history", {})
+
+    lines = _brand_header(brand)
+
+    # Revenue trend
+    if history and history.get("samples"):
+        samples = history["samples"]
+        lines.append(f"\n*Revenue Trend* ({history.get('total_weeks', '?')} weeks of data):")
+        for s in samples[-6:]:
+            lines.append(f"  {s.get('date', '?')}  —  {_money(s.get('revenue'))}/wk  ·  {s.get('asins', '?')} ASINs")
+
+    # Top products with detail
+    if products:
+        lines.append("\n*Top Products:*")
+        for i, p in enumerate(products[:5], 1):
+            title = (p.get("title") or "")[:55]
+            prev = _money(p.get("revenue"))
+            rank = p.get("rank") or "—"
+            sellers_ct = p.get("num_sellers") or "—"
+            growth = _pct(p.get("mom_growth"))
+            bbp = f"${p.get('buybox_price', 0):.2f}" if p.get("buybox_price") else "—"
+            lines.append(f"{i}. *{title}*")
+            lines.append(f"    {prev}/mo  ·  Rank #{rank}  ·  {sellers_ct} sellers  ·  BB ${bbp}  ·  {growth} MoM")
+
+    # Per-product organic ranks & search terms
+    if product_details:
+        lines.append("\n*Product Deep-Dive:*")
+        for det in product_details[:3]:
+            asin = det.get("asin", "?")
+            lines.append(f"\n  _ASIN {asin}_")
+
+            ranks = det.get("organic_ranks", [])
+            if ranks:
+                total = det.get("total_ranked_terms", len(ranks))
+                lines.append(f"  Organic ranks ({total} terms total, top 10):")
+                for r in ranks[:10]:
+                    term = r.get("term", "?")
+                    pos = r.get("rank", "?")
+                    vol = r.get("volume")
+                    vol_str = f"  ·  {vol:,} vol" if vol else ""
+                    lines.append(f"    #{pos} — _{term}_{vol_str}")
+
+            bb = det.get("buybox_sellers", [])
+            if bb:
+                lines.append(f"  Buy Box sellers:")
+                for s in bb[:5]:
+                    sname = s.get("seller") or "?"
+                    pct = f"{s.get('buybox_pct', 0):.0f}%" if s.get("buybox_pct") else "—"
+                    fba = " (FBA)" if s.get("is_fba") else ""
+                    lines.append(f"    • {sname} — {pct} BB{fba}")
+
+    # Seller coverage
+    if sellers:
+        lines.append("\n*Seller Coverage:*")
+        for s in sellers[:7]:
+            sname = s.get("name") or "?"
+            srev = _money(s.get("revenue"))
+            offers = s.get("offers") or "?"
+            pct = f"{s.get('brand_pct', 0):.0f}%" if s.get("brand_pct") else "—"
+            lines.append(f"• {sname}  —  {srev}/mo  ·  {offers} offers  ·  {pct} brand share")
+
+    # Competitors
+    if competitors and competitors.get("top_15"):
+        lines.append(f"\n*Competitors* (vs ASIN {competitors.get('for_asin', '?')}):")
+        for c in competitors["top_15"][:8]:
+            cname = c.get("brand") or "?"
+            ctitle = (c.get("title") or "")[:40]
+            crev = _money(c.get("revenue"))
+            rel = f"{c.get('relevancy', 0):.0f}%" if c.get("relevancy") else ""
+            lines.append(f"• {cname} — {ctitle}  ·  {crev}/mo  {rel}")
+
+    # Subcategory landscape
+    if landscape and landscape.get("top_brands"):
+        lines.append(f"\n*Category Landscape* (SubCat `{landscape.get('subcategory_id')}`):")
+        for lb in landscape["top_brands"][:8]:
+            lname = lb.get("brand") or "?"
+            lrev = _money(lb.get("revenue"))
+            share = f"{lb.get('market_share', 0):.1f}%" if lb.get("market_share") else ""
+            lines.append(f"• {lname}  —  {lrev}/wk  {share}")
 
     return {"response_type": "in_channel", "text": "\n".join(lines)}
 
@@ -140,7 +230,9 @@ def _format_report(report: dict) -> dict:
 def _do_smartscout_work(query: str) -> dict:
     _set_admin_context()
 
-    search_term = query[7:].strip() if query.lower().startswith("report ") else query
+    is_full = query.lower().startswith("report ")
+    search_term = query[7:].strip() if is_full else query
+    fmt = _format_full_report if is_full else _format_summary
 
     # If it's a numeric ID, go straight to report
     try:
@@ -148,7 +240,7 @@ def _do_smartscout_work(query: str) -> dict:
         report = _ss.brand_report(brand_id=brand_id)
         if isinstance(report, dict) and "error" in report:
             return {"response_type": "in_channel", "text": f"SmartScout error: {report['error']}"}
-        return _format_report(report)
+        return fmt(report)
     except ValueError:
         pass
 
@@ -162,7 +254,7 @@ def _do_smartscout_work(query: str) -> dict:
         if bid:
             report = _ss.brand_report(brand_id=bid)
             if isinstance(report, dict) and "error" not in report:
-                return _format_report(report)
+                return fmt(report)
 
     return _format_search(brands)
 
@@ -171,8 +263,8 @@ def _do_smartscout_work(query: str) -> dict:
 
 _HELP_TEXT = (
     "*SmartScout Brand Lookup*\n\n"
-    "`/coldmessage [brand name]` — search for a brand and auto-pull report if 1 match\n"
-    "`/coldmessage report [brand_id]` — full brand dossier by ID\n"
+    "`/coldmessage [brand]` — quick summary (revenue, top products)\n"
+    "`/coldmessage report [brand]` — full dossier (organic ranks, search terms, sellers, competitors, category landscape)\n"
     "`/coldmessage help` — show this message"
 )
 
