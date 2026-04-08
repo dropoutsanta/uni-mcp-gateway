@@ -37,10 +37,13 @@ _ss = SmartScoutPlugin()
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
+_CRED_KEY_ID = "g0d"
+
+
 def _set_admin_context() -> None:
     _current_context.set(
         RequestContext(
-            key_id=auth.ADMIN_KEY_ID,
+            key_id=_CRED_KEY_ID,
             is_admin=True,
             credentials={},
             data_scopes={},
