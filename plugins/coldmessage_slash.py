@@ -1,7 +1,9 @@
-"""Slack /coldmessage slash-command handler for SmartScout brand lookups.
+"""Slack /coldmessage slash-command via Socket Mode for SmartScout brand lookups.
 
-Restricted to #axisbrands (C0A5KV5QQ6S). Registers a webhook route at
-/webhook/coldmessage that Slack POSTs to when someone uses the command.
+Connects to Slack via WebSocket (Socket Mode) and listens for /coldmessage.
+Restricted to #axisbrands (C0A5KV5QQ6S).
+
+Requires SLACK_APP_TOKEN env var (xapp-...) with connections:write scope.
 
 Usage in Slack:
   /coldmessage Nike          — search for a brand
@@ -11,14 +13,15 @@ Usage in Slack:
 
 from __future__ import annotations
 
-import asyncio
 import logging
+import os
+import threading
 import traceback
 
 import httpx
-from starlette.requests import Request
-from starlette.responses import JSONResponse
-from starlette.routing import Route
+from slack_sdk.socket_mode import SocketModeClient
+from slack_sdk.socket_mode.request import SocketModeRequest
+from slack_sdk.socket_mode.response import SocketModeResponse
 
 import auth
 from plugin_base import MCPPlugin, RequestContext, ToolDef, _current_context
@@ -29,6 +32,9 @@ logger = logging.getLogger(__name__)
 ALLOWED_CHANNELS = {"C0A5KV5QQ6S"}
 
 _ss = SmartScoutPlugin()
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 
 def _set_admin_context() -> None:
@@ -66,7 +72,9 @@ def _format_search(brands: list[dict]) -> dict:
     for b in brands[:15]:
         rev = _money(b.get("monthlyRevenue"))
         growth = _pct(b.get("momGrowth"))
-        lines.append(f"• *{b.get('name', '?')}* — {rev}/mo ({growth} MoM)  ·  ID `{b.get('id')}`")
+        lines.append(
+            f"• *{b.get('name', '?')}* — {rev}/mo ({growth} MoM)  ·  ID `{b.get('id')}`"
+        )
 
     if len(brands) > 15:
         lines.append(f"\n_…and {len(brands) - 15} more_")
@@ -78,7 +86,6 @@ def _format_search(brands: list[dict]) -> dict:
 def _format_report(report: dict) -> dict:
     brand = report.get("brand", {})
     products = report.get("products", [])
-    history = report.get("revenue_history", {})
     cats = report.get("category_breakdown", [])
 
     name = brand.get("name", "Unknown")
@@ -121,18 +128,13 @@ def _format_report(report: dict) -> dict:
             crev = _money(c.get("latest_revenue"))
             lines.append(f"• SubCat `{c.get('subcategory_id')}`: {crev}/wk")
 
-    if history and history.get("samples"):
-        samples = history["samples"]
-        if len(samples) >= 2:
-            first = samples[0]
-            last = samples[-1]
-            lines.append(f"\n*Trend:* {first.get('date', '?')} → {last.get('date', '?')}")
-
     return {"response_type": "in_channel", "text": "\n".join(lines)}
 
 
+# ── SmartScout work (runs in a background thread) ───────────────────────────
+
+
 def _do_smartscout_work(query: str) -> dict:
-    """Run SmartScout lookups synchronously (called via asyncio.to_thread)."""
     _set_admin_context()
 
     if query.lower().startswith("report "):
@@ -140,8 +142,10 @@ def _do_smartscout_work(query: str) -> dict:
         try:
             brand_id = int(brand_id_str)
         except ValueError:
-            return {"response_type": "ephemeral", "text": f"Invalid brand ID: `{brand_id_str}`. Use a numeric ID from search results."}
-
+            return {
+                "response_type": "ephemeral",
+                "text": f"Invalid brand ID: `{brand_id_str}`. Use a numeric ID from search results.",
+            }
         report = _ss.brand_report(brand_id=brand_id)
         if isinstance(report, dict) and "error" in report:
             return {"response_type": "in_channel", "text": f"SmartScout error: {report['error']}"}
@@ -152,7 +156,6 @@ def _do_smartscout_work(query: str) -> dict:
         return {"response_type": "in_channel", "text": f"SmartScout error: {result['error']}"}
 
     brands = result.get("brands", [])
-
     if len(brands) == 1:
         bid = brands[0].get("id")
         if bid:
@@ -163,64 +166,99 @@ def _do_smartscout_work(query: str) -> dict:
     return _format_search(brands)
 
 
-async def _post_to_slack(response_url: str, payload: dict) -> None:
-    async with httpx.AsyncClient() as client:
-        await client.post(response_url, json=payload, timeout=15)
+# ── Socket Mode handler ─────────────────────────────────────────────────────
+
+_HELP_TEXT = (
+    "*SmartScout Brand Lookup*\n\n"
+    "`/coldmessage [brand name]` — search for a brand and auto-pull report if 1 match\n"
+    "`/coldmessage report [brand_id]` — full brand dossier by ID\n"
+    "`/coldmessage help` — show this message"
+)
 
 
-async def _process_query(query: str, response_url: str) -> None:
-    try:
-        payload = await asyncio.to_thread(_do_smartscout_work, query)
-        await _post_to_slack(response_url, payload)
-    except Exception as exc:
-        logger.error("coldmessage error: %s", traceback.format_exc())
-        try:
-            await _post_to_slack(response_url, {
-                "response_type": "ephemeral",
-                "text": f"Something went wrong: {exc}",
-            })
-        except Exception:
-            pass
+def _handle_socket_event(client: SocketModeClient, req: SocketModeRequest) -> None:
+    if req.type != "slash_commands":
+        return
 
+    payload = req.payload or {}
+    if payload.get("command") != "/coldmessage":
+        return
 
-async def handle_coldmessage(request: Request) -> JSONResponse:
-    form = await request.form()
-    channel_id = form.get("channel_id", "")
-    text = (form.get("text") or "").strip()
-    response_url = form.get("response_url", "")
+    channel_id = payload.get("channel_id", "")
+    text = (payload.get("text") or "").strip()
+    response_url = payload.get("response_url", "")
 
     if channel_id not in ALLOWED_CHANNELS:
-        return JSONResponse({
-            "response_type": "ephemeral",
-            "text": "This command is only available in #axisbrands.",
-        })
+        client.send_socket_mode_response(
+            SocketModeResponse(
+                envelope_id=req.envelope_id,
+                payload={"response_type": "ephemeral", "text": "This command is only available in #axisbrands."},
+            )
+        )
+        return
 
     if not text or text.lower() == "help":
-        return JSONResponse({
-            "response_type": "ephemeral",
-            "text": (
-                "*SmartScout Brand Lookup*\n\n"
-                "`/coldmessage [brand name]` — search for a brand and auto-pull report if 1 match\n"
-                "`/coldmessage report [brand_id]` — full brand dossier by ID\n"
-                "`/coldmessage help` — show this message"
-            ),
-        })
+        client.send_socket_mode_response(
+            SocketModeResponse(
+                envelope_id=req.envelope_id,
+                payload={"response_type": "ephemeral", "text": _HELP_TEXT},
+            )
+        )
+        return
 
-    asyncio.create_task(_process_query(text, response_url))
-
+    ack = f":mag: Searching SmartScout for *{text}*…"
     if text.lower().startswith("report "):
         ack = ":bar_chart: Pulling full SmartScout report…"
-    else:
-        ack = f":mag: Searching SmartScout for *{text}*…"
 
-    return JSONResponse({"response_type": "in_channel", "text": ack})
+    client.send_socket_mode_response(
+        SocketModeResponse(
+            envelope_id=req.envelope_id,
+            payload={"response_type": "in_channel", "text": ack},
+        )
+    )
+
+    def _bg() -> None:
+        try:
+            result = _do_smartscout_work(text)
+            httpx.post(response_url, json=result, timeout=30)
+        except Exception:
+            logger.error("coldmessage bg error:\n%s", traceback.format_exc())
+            try:
+                httpx.post(
+                    response_url,
+                    json={"response_type": "ephemeral", "text": "Something went wrong. Try again."},
+                    timeout=10,
+                )
+            except Exception:
+                pass
+
+    threading.Thread(target=_bg, daemon=True).start()
+
+
+def _start_socket_mode() -> None:
+    app_token = os.environ.get("SLACK_APP_TOKEN", "")
+    if not app_token:
+        logger.warning("[coldmessage] SLACK_APP_TOKEN not set — Socket Mode disabled")
+        return
+
+    try:
+        sm_client = SocketModeClient(app_token=app_token)
+        sm_client.socket_mode_request_listeners.append(_handle_socket_event)
+        sm_client.connect()
+        logger.info("[coldmessage] Socket Mode connected")
+    except Exception:
+        logger.error("[coldmessage] Socket Mode failed:\n%s", traceback.format_exc())
+
+
+# ── Plugin definition ────────────────────────────────────────────────────────
 
 
 class ColdMessageSlashPlugin(MCPPlugin):
-    """No MCP tools — just registers the /webhook/coldmessage route."""
+    """No MCP tools — starts a Socket Mode listener for /coldmessage."""
 
     name = "coldmessage_slash"
     tools: dict[str, ToolDef] = {}
 
-    def extra_routes(self) -> list[Route]:
-        return [Route("/slack/coldmessage", endpoint=handle_coldmessage, methods=["POST"])]
+    def __init__(self) -> None:
+        super().__init__()
+        threading.Thread(target=_start_socket_mode, daemon=True, name="coldmessage-socket").start()
