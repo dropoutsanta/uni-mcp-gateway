@@ -5,12 +5,17 @@ Credentials come from gateway get_credentials("linear") -> {"api_key": "..."}.
 Auth header: Authorization: <api_key> (raw key, not Bearer).
 """
 
+import base64
 import json
+import re
 from typing import Any, Optional
 
 import requests
 
 from plugin_base import MCPPlugin, ToolDef, get_credentials
+
+_UPLOAD_URL_RE = re.compile(r"https://uploads\.linear\.app/[^\s\)\"'>]+", re.IGNORECASE)
+_MAX_IMAGE_BYTES = 2 * 1024 * 1024  # skip images > 2MB
 
 _LINEAR_ENDPOINT = "https://api.linear.app/graphql"
 
@@ -61,6 +66,50 @@ def _linear_request(query: str, variables: Optional[dict] = None) -> dict:
         return {"error": "; ".join(messages), "graphql_errors": data["errors"]}
 
     return data.get("data", {})
+
+
+def _fetch_linear_image(url: str, api_key: str) -> dict | None:
+    """Download an image from uploads.linear.app and return as base64.
+
+    Returns {url, base64, mime_type} or None on failure.
+    Linear file storage accepts both 'Authorization: <key>' and 'Bearer <key>'.
+    """
+    for auth_val in [api_key, f"Bearer {api_key}"]:
+        try:
+            resp = requests.get(
+                url,
+                headers={"Authorization": auth_val},
+                timeout=15,
+                stream=True,
+            )
+            if resp.status_code == 200:
+                ct = resp.headers.get("Content-Type", "")
+                if not ct.startswith("image/"):
+                    return None
+                data = resp.content
+                if len(data) > _MAX_IMAGE_BYTES:
+                    return None
+                return {
+                    "url": url,
+                    "base64": base64.b64encode(data).decode(),
+                    "mime_type": ct.split(";")[0].strip(),
+                }
+        except Exception:
+            continue
+    return None
+
+
+def _extract_images_from_body(body: str, api_key: str) -> list[dict]:
+    """Find uploads.linear.app URLs in markdown body and download them."""
+    if not body or "uploads.linear.app" not in body:
+        return []
+    urls = _UPLOAD_URL_RE.findall(body)
+    images = []
+    for url in urls:
+        img = _fetch_linear_image(url, api_key)
+        if img:
+            images.append(img)
+    return images
 
 
 def _clean_team(node: dict) -> dict:
@@ -230,13 +279,19 @@ def get_issue(issue_id: str) -> dict:
     issue = data.get("issue")
     if not issue:
         return {"error": "Issue not found"}
-    return {"issue": _clean_issue(issue) | {
+    result: dict[str, Any] = {"issue": _clean_issue(issue) | {
         "project": {"id": (p := issue.get("project") or {}).get("id"), "name": p.get("name")} if p else None,
         "cycle": {"id": (c := issue.get("cycle") or {}).get("id"), "name": c.get("name")} if c else None,
         "labels": [{"id": l.get("id"), "name": l.get("name"), "color": l.get("color")} for l in (issue.get("labels") or {}).get("nodes", [])],
         "attachments": [{"id": a.get("id"), "title": a.get("title"), "url": a.get("url")} for a in (issue.get("attachments") or {}).get("nodes", [])],
         "branchName": issue.get("branchName"),
     }}
+    api_key = get_credentials("linear").get("api_key", "")
+    if api_key:
+        desc_images = _extract_images_from_body(issue.get("description", ""), api_key)
+        if desc_images:
+            result["_images"] = desc_images
+    return result
 
 
 def search_issues(query: str, limit: int = 50) -> dict:
@@ -465,8 +520,9 @@ def get_user(user_id: str) -> dict:
     return {"user": _clean_user(u)}
 
 
-def list_comments(issue_id: str, limit: int = 50, after_cursor: Optional[str] = None) -> dict:
-    """List comments on an issue."""
+def list_comments(issue_id: str, limit: int = 50, after_cursor: Optional[str] = None, include_images: bool = True) -> dict:
+    """List comments on an issue. Images from uploads.linear.app are
+    automatically downloaded and returned inline as base64 by default."""
     after = f', after: "{after_cursor}"' if after_cursor else ""
     query = f"""
     query($issueId: ID!) {{
@@ -487,7 +543,28 @@ def list_comments(issue_id: str, limit: int = 50, after_cursor: Optional[str] = 
     cm = issue.get("comments", {})
     nodes = cm.get("nodes", [])
     pi = cm.get("pageInfo", {})
-    return {"comments": [{"id": n.get("id"), "body": n.get("body"), "createdAt": n.get("createdAt"), "user": _clean_user(n.get("user"))} for n in nodes], "pageInfo": pi}
+
+    api_key = get_credentials("linear").get("api_key", "") if include_images else ""
+    comments = []
+    all_images: list[dict] = []
+    for n in nodes:
+        comment: dict[str, Any] = {
+            "id": n.get("id"),
+            "body": n.get("body"),
+            "createdAt": n.get("createdAt"),
+            "user": _clean_user(n.get("user")),
+        }
+        if api_key:
+            imgs = _extract_images_from_body(n.get("body", ""), api_key)
+            if imgs:
+                comment["image_count"] = len(imgs)
+                all_images.extend(imgs)
+        comments.append(comment)
+
+    result: dict[str, Any] = {"comments": comments, "pageInfo": pi}
+    if all_images:
+        result["_images"] = all_images
+    return result
 
 
 def list_documents(limit: int = 50, after_cursor: Optional[str] = None) -> dict:
@@ -1033,7 +1110,7 @@ class LinearPlugin(MCPPlugin):
         "list_comments": ToolDef(
             access="read",
             handler=list_comments,
-            description="List comments on an issue.",
+            description="List comments on an issue. Images from uploads.linear.app are auto-downloaded and returned inline. Pass include_images=false to skip.",
         ),
         "list_documents": ToolDef(
             access="read",

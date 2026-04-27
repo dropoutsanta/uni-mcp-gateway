@@ -27,6 +27,8 @@ import audit
 import dashboard
 import external_mcp
 import media
+import llm_proxy
+
 from plugin_base import (
     MCPPlugin,
     RequestContext,
@@ -477,15 +479,39 @@ def _to_mcp_image_content(result: dict) -> list:
         token = media.create_token(file_path)
         media_url = f"{_MCP_BASE_URL}/media/{token}"
 
+    # Preserve any text/caption that came alongside the image (e.g. WhatsApp
+    # image captions). Without this, bots would see the image but lose the
+    # surrounding text from the same message.
+    payload = {
+        "success": True,
+        "media_url": media_url,
+        "content_type": content_type,
+        "note": "media_url is valid for 5 minutes. Use it to pass this image to other tools/APIs.",
+    }
+    caption = result.get("text") or result.get("caption")
+    if caption:
+        payload["text"] = caption
+        payload["caption"] = caption
+
     return [
         ImageContent(type="image", data=b64_data, mimeType=content_type),
-        TextContent(type="text", text=json.dumps({
-            "success": True,
-            "media_url": media_url,
-            "content_type": content_type,
-            "note": "media_url is valid for 5 minutes. Use it to pass this image to other tools/APIs.",
-        })),
+        TextContent(type="text", text=json.dumps(payload)),
     ]
+
+
+def _to_mcp_mixed_content(result: dict) -> list:
+    """Convert a result with _images into interleaved Text + Image content blocks."""
+    from mcp.types import ImageContent, TextContent
+
+    images = result.pop("_images", [])
+    blocks: list = [TextContent(type="text", text=json.dumps(result))]
+    for img in images:
+        blocks.append(ImageContent(
+            type="image",
+            data=img["base64"],
+            mimeType=img.get("mime_type", "image/png"),
+        ))
+    return blocks
 
 
 @mcp.tool()
@@ -530,6 +556,9 @@ def call_tool(tool_name: str, params_json: str = "{}", account: Optional[str] = 
 
     if isinstance(result, dict) and result.get("image_base64") and result.get("success"):
         return _to_mcp_image_content(result)
+
+    if isinstance(result, dict) and result.get("_images"):
+        return _to_mcp_mixed_content(result)
 
     return result
 
@@ -1226,6 +1255,7 @@ _PUBLIC_PREFIXES = (
     "/dash",
     "/webhook/",
     "/slack/",
+    "/llm/",
     "/media/",
 )
 
@@ -1592,7 +1622,17 @@ def _build_app() -> ASGIApp:
     @contextlib.asynccontextmanager
     async def lifespan(app):
         async with mcp_handler.session_manager.run():
-            yield
+            from pod_manager import idle_watcher as _idle_watcher
+            _watcher_task = asyncio.create_task(_idle_watcher(pod_registry))
+            try:
+                yield
+            finally:
+                _watcher_task.cancel()
+                try:
+                    await _watcher_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                await pod_registry.aclose()
 
     sse = SseServerTransport("/messages")
     mcp_server = mcp._mcp_server
@@ -1600,6 +1640,16 @@ def _build_app() -> ASGIApp:
     async def handle_sse(request: Request):
         async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
             await mcp_server.run(streams[0], streams[1], mcp_server.create_initialization_options())
+
+    litellm_proxy_url = os.environ.get("LITELLM_PROXY_URL", "http://127.0.0.1:4000").rstrip("/")
+    runpod_api_key = os.environ.get("RUNPOD_API_KEY", "")
+    # Persist slot→pod_id mapping to the Fly volume so that auto-respawned
+    # pod_ids survive gateway restarts. Without this the registry boots with
+    # whatever pod_id is hard-coded in POD_CONFIGS and points at a (likely
+    # terminated) old pod until the next respawn fires.
+    pod_state_path = os.environ.get("POD_STATE_PATH", "/data/pod_state.json")
+    pod_registry = llm_proxy.build_pod_registry(runpod_api_key, state_path=pod_state_path)
+    _llm_app = llm_proxy.make_proxy_asgi(pod_registry, litellm_proxy_url)
 
     routes = [
         Route("/.well-known/oauth-protected-resource", oauth_protected_resource),
@@ -1619,7 +1669,10 @@ def _build_app() -> ASGIApp:
         Route("/api/v1/tools/{tool_name}", api_get_tool_schema),
         Route("/api/v1/call", api_call_tool, methods=["POST"]),
         Route("/api/v1/batch", api_batch, methods=["POST"]),
+        *llm_proxy.make_status_routes(pod_registry),
+        Mount("/llm", app=_llm_app),
     ]
+
 
     for route in dashboard.get_dashboard_routes():
         routes.append(route)
