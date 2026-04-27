@@ -525,7 +525,7 @@ def list_comments(issue_id: str, limit: int = 50, after_cursor: Optional[str] = 
     automatically downloaded and returned inline as base64 by default."""
     after = f', after: "{after_cursor}"' if after_cursor else ""
     query = f"""
-    query($issueId: ID!) {{
+    query($issueId: String!) {{
       issue(id: $issueId) {{
         comments(first: {min(limit, 250)}{after}) {{
           nodes {{ id body createdAt updatedAt user {{ id name email }} }}
