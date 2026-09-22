@@ -679,26 +679,30 @@ def get_direct_chat_by_contact(sender_phone_number: str, allowed_jids: Optional[
             conn.close()
 
 
-def send_message(recipient: str, message: str) -> Tuple[bool, str]:
+def send_message(recipient: str, message: str, reply_to_message_id: str = "", reply_to_chat_jid: str = "") -> Tuple[bool, str, str]:
     try:
         if not recipient:
-            return False, "Recipient must be provided"
+            return False, "Recipient must be provided", ""
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {"recipient": recipient, "message": message}
-        response = requests.post(url, json=payload, headers=_bridge_headers())
+        if reply_to_message_id:
+            payload["reply_to_message_id"] = reply_to_message_id
+        if reply_to_chat_jid:
+            payload["reply_to_chat_jid"] = reply_to_chat_jid
+        response = requests.post(url, json=payload, headers=_bridge_headers(), timeout=30)
         if response.status_code == 200:
             result = response.json()
-            return result.get("success", False), result.get("message", "Unknown response")
-        return False, f"Error: HTTP {response.status_code} - {response.text}"
+            return result.get("success", False), result.get("message", "Unknown response"), result.get("message_id", "")
+        return False, f"Error: HTTP {response.status_code} - {response.text}", ""
     except requests.RequestException as e:
-        return False, f"Request error: {str(e)}"
+        return False, f"Request error: {str(e)}", ""
     except json.JSONDecodeError:
-        return False, f"Error parsing response: {response.text}"
+        return False, f"Error parsing response: {response.text}", ""
     except Exception as e:
-        return False, f"Unexpected error: {str(e)}"
+        return False, f"Unexpected error: {str(e)}", ""
 
 
-def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
+def send_file(recipient: str, media_path: str, caption: str = "") -> Tuple[bool, str]:
     try:
         if not recipient:
             return False, "Recipient must be provided"
@@ -708,7 +712,9 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
             return False, f"Media file not found: {media_path}"
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {"recipient": recipient, "media_path": media_path}
-        response = requests.post(url, json=payload, headers=_bridge_headers())
+        if caption:
+            payload["message"] = caption
+        response = requests.post(url, json=payload, headers=_bridge_headers(), timeout=60)
         if response.status_code == 200:
             result = response.json()
             return result.get("success", False), result.get("message", "Unknown response")

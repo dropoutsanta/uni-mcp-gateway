@@ -27,8 +27,8 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
-	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
+	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -217,34 +217,110 @@ func extractTextContent(msg *waProto.Message) string {
 		return ""
 	}
 
-	// Try to get text content
+	// Plain text message
 	if text := msg.GetConversation(); text != "" {
 		return text
-	} else if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
-		return extendedText.GetText()
+	}
+	if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
+		if t := extendedText.GetText(); t != "" {
+			return t
+		}
 	}
 
-	// For now, we're ignoring non-text messages
+	// Captions on media messages — these were previously lost, which meant
+	// downloading an image would never give the bot the surrounding text.
+	if img := msg.GetImageMessage(); img != nil {
+		if c := img.GetCaption(); c != "" {
+			return c
+		}
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		if c := vid.GetCaption(); c != "" {
+			return c
+		}
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		if c := doc.GetCaption(); c != "" {
+			return c
+		}
+	}
+
 	return ""
 }
 
 // SendMessageResponse represents the response for the send message API
 type SendMessageResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
+	Success   bool   `json:"success"`
+	Message   string `json:"message"`
+	MessageID string `json:"message_id,omitempty"`
 }
 
 // SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
-	Recipient string `json:"recipient"`
-	Message   string `json:"message"`
-	MediaPath string `json:"media_path,omitempty"`
+	Recipient      string `json:"recipient"`
+	Message        string `json:"message"`
+	MediaPath      string `json:"media_path,omitempty"`
+	ReplyToMessage string `json:"reply_to_message_id,omitempty"`
+	ReplyToChatJID string `json:"reply_to_chat_jid,omitempty"`
+}
+
+func normalizeParticipant(sender string) string {
+	if sender == "" {
+		return ""
+	}
+	if strings.Contains(sender, "@") {
+		return sender
+	}
+	return types.NewJID(sender, "s.whatsapp.net").String()
+}
+
+func (store *MessageStore) BuildReplyContext(messageID, chatJID string) (*waProto.ContextInfo, error) {
+	if messageID == "" {
+		return nil, nil
+	}
+
+	var sender, content, mediaType string
+	var isFromMe bool
+	err := store.db.QueryRow(
+		"SELECT sender, content, is_from_me, media_type FROM messages WHERE id = ? AND chat_jid = ? LIMIT 1",
+		messageID, chatJID,
+	).Scan(&sender, &content, &isFromMe, &mediaType)
+	if err != nil {
+		return nil, fmt.Errorf("quoted message not found: %w", err)
+	}
+
+	quoted := &waProto.Message{}
+	switch mediaType {
+	case "image":
+		quoted.ImageMessage = &waProto.ImageMessage{Caption: proto.String(content)}
+	case "video":
+		quoted.VideoMessage = &waProto.VideoMessage{Caption: proto.String(content)}
+	case "audio":
+		quoted.AudioMessage = &waProto.AudioMessage{}
+	case "document":
+		quoted.DocumentMessage = &waProto.DocumentMessage{Caption: proto.String(content)}
+	default:
+		quoted.Conversation = proto.String(content)
+	}
+
+	ctx := &waProto.ContextInfo{
+		StanzaID:      proto.String(messageID),
+		RemoteJID:     proto.String(chatJID),
+		QuotedMessage: quoted,
+	}
+	if !isFromMe {
+		participant := normalizeParticipant(sender)
+		if participant != "" {
+			ctx.Participant = proto.String(participant)
+		}
+	}
+	return ctx, nil
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, replyToMessageID string, replyToChatJID string) (bool, string, string) {
 	if !client.IsConnected() {
-		return false, "Not connected to WhatsApp"
+		return false, "Not connected to WhatsApp", ""
 	}
 
 	// Create JID for recipient
@@ -258,7 +334,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Parse the JID string
 		recipientJID, err = types.ParseJID(recipient)
 		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+			return false, fmt.Sprintf("Error parsing JID: %v", err), ""
 		}
 	} else {
 		// Resolve phone number via IsOnWhatsApp to get the correct LID-aware JID
@@ -273,6 +349,14 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		}
 	}
 
+	if replyToChatJID == "" {
+		replyToChatJID = recipientJID.String()
+	}
+	replyContext, err := messageStore.BuildReplyContext(replyToMessageID, replyToChatJID)
+	if err != nil {
+		return false, fmt.Sprintf("Error building reply context: %v", err), ""
+	}
+
 	msg := &waProto.Message{}
 
 	// Check if we have media to send
@@ -280,7 +364,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+			return false, fmt.Sprintf("Error reading media file: %v", err), ""
 		}
 
 		// Determine media type and mime type based on file extension
@@ -329,7 +413,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Upload media to WhatsApp servers
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err)
+			return false, fmt.Sprintf("Error uploading media: %v", err), ""
 		}
 
 		fmt.Println("Media uploaded", resp)
@@ -346,6 +430,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileEncSHA256: resp.FileEncSHA256,
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
+				ContextInfo:   replyContext,
 			}
 		case whatsmeow.MediaAudio:
 			// Handle ogg audio files
@@ -359,7 +444,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
 				} else {
-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
+					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err), ""
 				}
 			} else {
 				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
@@ -376,6 +461,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				Seconds:       proto.Uint32(seconds),
 				PTT:           proto.Bool(true),
 				Waveform:      waveform,
+				ContextInfo:   replyContext,
 			}
 		case whatsmeow.MediaVideo:
 			msg.VideoMessage = &waProto.VideoMessage{
@@ -387,6 +473,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileEncSHA256: resp.FileEncSHA256,
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
+				ContextInfo:   replyContext,
 			}
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
@@ -399,27 +486,57 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileEncSHA256: resp.FileEncSHA256,
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
+				ContextInfo:   replyContext,
 			}
 		}
 	} else {
-		msg.Conversation = proto.String(message)
+		if replyContext != nil {
+			msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
+				Text:        proto.String(message),
+				ContextInfo: replyContext,
+			}
+		} else {
+			msg.Conversation = proto.String(message)
+		}
 	}
 
 	// Send message — retry without LID if the recipient hasn't been migrated yet
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	sendResp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil && strings.Contains(err.Error(), "no LID found") {
 		origTS := client.Store.LIDMigrationTimestamp
 		client.Store.LIDMigrationTimestamp = 0
-		_, err = client.SendMessage(context.Background(), recipientJID, msg)
+		sendResp, err = client.SendMessage(context.Background(), recipientJID, msg)
 		client.Store.LIDMigrationTimestamp = origTS
 	}
 
 	if err != nil {
-		return false, fmt.Sprintf("Error sending message: %v", err)
+		return false, fmt.Sprintf("Error sending message: %v", err), ""
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	sentAt := sendResp.Timestamp
+	if sentAt.IsZero() {
+		sentAt = time.Now()
+	}
+	_ = messageStore.StoreChat(recipientJID.String(), recipientJID.String(), sentAt)
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg)
+	_ = messageStore.StoreMessage(
+		string(sendResp.ID),
+		recipientJID.String(),
+		client.Store.ID.User,
+		message,
+		sentAt,
+		true,
+		mediaType,
+		filename,
+		url,
+		mediaKey,
+		fileSHA256,
+		fileEncSHA256,
+		fileLength,
+	)
+
+	return true, fmt.Sprintf("Message sent to %s", recipient), string(sendResp.ID)
 }
 
 // Extract media info from a message
@@ -811,7 +928,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message, messageID := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, req.ReplyToMessage, req.ReplyToChatJID)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -823,8 +940,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		// Send response
 		json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: message,
+			Success:   success,
+			Message:   message,
+			MessageID: messageID,
 		})
 	}))
 
@@ -866,7 +984,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":      true,
+			"success":       true,
 			"total_groups":  len(groups),
 			"stored_groups": stored,
 		})
@@ -922,7 +1040,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":        true,
+			"success":         true,
 			"total_contacts":  len(contacts),
 			"stored_contacts": stored,
 		})
@@ -977,8 +1095,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"success":          true,
-			"groups_processed":  groupsProcessed,
-			"total_members":     totalMembers,
+			"groups_processed": groupsProcessed,
+			"total_members":    totalMembers,
 		})
 	}))
 
@@ -1022,10 +1140,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": true,
+			"success":   true,
 			"group_jid": groupJID,
-			"members": members,
-			"count":   len(members),
+			"members":   members,
+			"count":     len(members),
 		})
 	}))
 
@@ -1069,14 +1187,14 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 							RequestID: &requestID,
 						},
 						HistorySyncConfig: &waCompanionReg.DeviceProps_HistorySyncConfig{
-							FullSyncDaysLimit:    &fullSyncDays,
-							FullSyncSizeMbLimit:  &storageMb,
-							StorageQuotaMb:       &storageMb,
-							RecentSyncDaysLimit:  &recentDays,
+							FullSyncDaysLimit:     &fullSyncDays,
+							FullSyncSizeMbLimit:   &storageMb,
+							StorageQuotaMb:        &storageMb,
+							RecentSyncDaysLimit:   &recentDays,
 							SupportCallLogHistory: &trueVal,
 							SupportGroupHistory:   &trueVal,
 							OnDemandReady:         &trueVal,
-							CompleteOnDemandReady:  &trueVal,
+							CompleteOnDemandReady: &trueVal,
 						},
 					},
 				},
@@ -1508,7 +1626,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		case http.MethodPost:
 			var body struct {
-				KeyID   string   `json:"key_id"`
+				KeyID    string   `json:"key_id"`
 				ChatJIDs []string `json:"chat_jids"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.KeyID == "" || len(body.ChatJIDs) == 0 {
@@ -1594,16 +1712,16 @@ func main() {
 	// Configure device properties for full history sync before creating the client
 	store.DeviceProps.RequireFullSync = proto.Bool(true)
 	store.DeviceProps.HistorySyncConfig = &waCompanionReg.DeviceProps_HistorySyncConfig{
-		FullSyncDaysLimit:         proto.Uint32(365 * 3),
-		FullSyncSizeMbLimit:       proto.Uint32(8192),
-		StorageQuotaMb:            proto.Uint32(8192),
-		InlineInitialPayloadInE2EeMsg: proto.Bool(true),
-		RecentSyncDaysLimit:       proto.Uint32(365),
-		SupportCallLogHistory:     proto.Bool(true),
+		FullSyncDaysLimit:              proto.Uint32(365 * 3),
+		FullSyncSizeMbLimit:            proto.Uint32(8192),
+		StorageQuotaMb:                 proto.Uint32(8192),
+		InlineInitialPayloadInE2EeMsg:  proto.Bool(true),
+		RecentSyncDaysLimit:            proto.Uint32(365),
+		SupportCallLogHistory:          proto.Bool(true),
 		SupportBotUserAgentChatHistory: proto.Bool(true),
-		SupportGroupHistory:       proto.Bool(true),
-		OnDemandReady:             proto.Bool(true),
-		CompleteOnDemandReady:     proto.Bool(true),
+		SupportGroupHistory:            proto.Bool(true),
+		OnDemandReady:                  proto.Bool(true),
+		CompleteOnDemandReady:          proto.Bool(true),
 	}
 
 	// Create client instance

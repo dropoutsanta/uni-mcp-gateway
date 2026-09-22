@@ -8,6 +8,7 @@ Uses get_data_scopes("whatsapp") for JID-based data scoping.
 """
 
 import base64
+import binascii
 import mimetypes
 import os
 import sqlite3
@@ -59,6 +60,8 @@ _WA_ACCOUNTS: dict[str, dict[str, str]] = {
 }
 
 _wa_lock = threading.Lock()
+_OUTBOUND_FILES_DIR = os.environ.get("WHATSAPP_OUTBOUND_FILES_DIR", "/data/results/whatsapp-outbound")
+_MAX_OUTBOUND_FILE_BYTES = 25 * 1024 * 1024
 
 
 def _get_allowed_accounts() -> Optional[set]:
@@ -270,25 +273,95 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5, accoun
         whatsapp_get_message_context(message_id, before, after, allowed_jids=_get_scope_jids())))
 
 
-def send_message(recipient: str, message: str, account: str = "") -> Dict[str, Any]:
+def send_message(recipient: str, message: str, reply_to_message_id: str = "", reply_to_chat_jid: str = "", account: str = "") -> Dict[str, Any]:
     if not recipient:
         return {"success": False, "message": "Recipient must be provided"}
     scope_err = _check_send_scope(recipient)
     if scope_err:
         return scope_err
+    if reply_to_chat_jid:
+        scope_err = _check_send_scope(reply_to_chat_jid)
+        if scope_err:
+            return scope_err
     def _do():
-        success, status_message = whatsapp_send_message(recipient, message)
-        return {"success": success, "message": status_message}
+        success, status_message, message_id = whatsapp_send_message(
+            recipient,
+            message,
+            reply_to_message_id=reply_to_message_id,
+            reply_to_chat_jid=reply_to_chat_jid,
+        )
+        result = {"success": success, "message": status_message}
+        if message_id:
+            result["message_id"] = message_id
+        return result
     return _with_account(account, _do)
 
 
-def send_file(recipient: str, media_path: str, account: str = "") -> Dict[str, Any]:
+def send_file(recipient: str, media_path: str, caption: str = "", account: str = "") -> Dict[str, Any]:
     scope_err = _check_send_scope(recipient)
     if scope_err:
         return scope_err
     def _do():
-        success, status_message = whatsapp_send_file(recipient, media_path)
+        success, status_message = whatsapp_send_file(recipient, media_path, caption=caption)
         return {"success": success, "message": status_message}
+    return _with_account(account, _do)
+
+
+def send_file_content(
+    recipient: str,
+    filename: str,
+    content: str = "",
+    content_base64: str = "",
+    caption: str = "",
+    account: str = "",
+) -> Dict[str, Any]:
+    """Create a file on the gateway and send it via WhatsApp.
+
+    Use content for text files such as CSV/JSON/TXT. Use content_base64 for
+    binary files or when preserving exact bytes matters.
+    """
+    if not filename:
+        return {"success": False, "message": "Filename must be provided"}
+    if not content and not content_base64:
+        return {"success": False, "message": "Provide content or content_base64"}
+
+    safe_name = os.path.basename(filename).replace("\x00", "")
+    if not safe_name or safe_name in {".", ".."}:
+        return {"success": False, "message": "Invalid filename"}
+
+    scope_err = _check_send_scope(recipient)
+    if scope_err:
+        return scope_err
+
+    try:
+        if content_base64:
+            data = base64.b64decode(content_base64, validate=True)
+        else:
+            data = content.encode("utf-8")
+    except (binascii.Error, ValueError) as exc:
+        return {"success": False, "message": f"Invalid content_base64: {exc}"}
+
+    if len(data) > _MAX_OUTBOUND_FILE_BYTES:
+        return {
+            "success": False,
+            "message": f"File too large ({len(data)} bytes). Max is {_MAX_OUTBOUND_FILE_BYTES} bytes.",
+        }
+
+    def _do():
+        os.makedirs(_OUTBOUND_FILES_DIR, exist_ok=True)
+        file_path = os.path.join(_OUTBOUND_FILES_DIR, safe_name)
+        with open(file_path, "wb") as f:
+            f.write(data)
+        success, status_message = whatsapp_send_file(recipient, file_path, caption=caption)
+        return {
+            "success": success,
+            "message": status_message,
+            "file_path": file_path,
+            "filename": safe_name,
+            "bytes": len(data),
+            "content_type": mimetypes.guess_type(file_path)[0] or "application/octet-stream",
+        }
+
     return _with_account(account, _do)
 
 
@@ -302,36 +375,73 @@ def send_audio_message(recipient: str, media_path: str, account: str = "") -> Di
     return _with_account(account, _do)
 
 
+def _fetch_message_text(message_id: str, chat_jid: str) -> Optional[str]:
+    """Look up the text/caption stored alongside a media message.
+
+    Returns the caption (or any other text on that message row), or None if
+    the message can't be found / has no text.
+    """
+    try:
+        conn = sqlite3.connect(_wa.MESSAGES_DB_PATH, timeout=3)
+        try:
+            row = conn.execute(
+                "SELECT content FROM messages WHERE id = ? AND chat_jid = ? LIMIT 1",
+                (message_id, chat_jid),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row and row[0]:
+            return row[0]
+    except sqlite3.Error:
+        pass
+    return None
+
+
 def download_media(message_id: str, chat_jid: str, account: str = "") -> Union[list, Dict[str, Any]]:
     allowed = _get_scope_jids()
     if allowed is not None and chat_jid not in allowed:
         return {"success": False, "message": "Access denied: chat not in your scope"}
 
     def _do():
+        # Pull the message's text/caption first so bots get it even if the
+        # media download fails (e.g. expired media on WhatsApp servers).
+        caption = _fetch_message_text(message_id, chat_jid)
+
         file_path = whatsapp_download_media(message_id, chat_jid)
         if not file_path:
-            return {"success": False, "message": "Failed to download media"}
+            result: Dict[str, Any] = {
+                "success": False,
+                "message": "Failed to download media",
+            }
+            if caption:
+                result["text"] = caption
+                result["caption"] = caption
+            return result
+
         content_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+        result: Dict[str, Any] = {
+            "success": True,
+            "message": "Media downloaded successfully",
+            "file_path": file_path,
+            "content_type": content_type,
+        }
+        if caption:
+            # Both keys for clarity — `text` is the generic field, `caption`
+            # is the WhatsApp-specific name. Bots can read either.
+            result["text"] = caption
+            result["caption"] = caption
+
         if content_type.startswith("image/") and os.path.isfile(file_path):
             try:
                 file_size = os.path.getsize(file_path)
                 if file_size < 10 * 1024 * 1024:
                     with open(file_path, "rb") as f:
                         b64_data = base64.b64encode(f.read()).decode()
-                    return {
-                        "success": True,
-                        "image_base64": b64_data,
-                        "content_type": content_type,
-                        "file_path": file_path,
-                    }
+                    result["image_base64"] = b64_data
             except OSError:
                 pass
-        return {
-            "success": True,
-            "message": "Media downloaded successfully",
-            "file_path": file_path,
-            "content_type": content_type,
-        }
+        return result
+
     return _with_account(account, _do)
 
 
@@ -457,7 +567,12 @@ class WhatsAppPlugin(MCPPlugin):
         "download_media": ToolDef(
             access="read",
             handler=download_media,
-            description="Download a media attachment (image, video, audio, document) from a WhatsApp message. Pass account for multi-account.",
+            description=(
+                "Download a media attachment (image, video, audio, document) from a WhatsApp message. "
+                "Returns the file (and image_base64 for images <10MB) PLUS the message's text/caption "
+                "in `text` and `caption` fields when present, so you get the image AND the surrounding text. "
+                "Pass account for multi-account."
+            ),
         ),
         "get_group_members": ToolDef(
             access="read",
@@ -467,12 +582,21 @@ class WhatsAppPlugin(MCPPlugin):
         "send_message": ToolDef(
             access="write",
             handler=send_message,
-            description="Send a text message via WhatsApp to a person or group. Pass account for multi-account.",
+            description="Send a text message via WhatsApp to a person or group. To send as a linked reply, pass reply_to_message_id and optionally reply_to_chat_jid. Pass account for multi-account.",
         ),
         "send_file": ToolDef(
             access="write",
             handler=send_file,
-            description="Send an image, video, or document file via WhatsApp. Pass account for multi-account.",
+            description="Send an image, video, or document file via WhatsApp from an existing gateway file path. Optional caption. Pass account for multi-account.",
+        ),
+        "send_file_content": ToolDef(
+            access="write",
+            handler=send_file_content,
+            description=(
+                "Create and send a WhatsApp document/image/video from inline content. "
+                "Use filename plus content for text files like CSV/JSON/TXT, or content_base64 for binary files. "
+                "Optional caption. Pass account for multi-account."
+            ),
         ),
         "send_audio_message": ToolDef(
             access="write",
