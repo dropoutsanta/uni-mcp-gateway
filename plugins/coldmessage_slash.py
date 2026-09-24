@@ -1,7 +1,7 @@
 """Slack /coldmessage slash-command via Socket Mode for SmartScout brand lookups.
 
 Connects to Slack via WebSocket (Socket Mode) and listens for /coldmessage.
-Restricted to #axisbrands (C0A5KV5QQ6S).
+Restricted to the Slack channel IDs in SLASH_ALLOWED_CHANNELS (comma-separated).
 
 Requires SLACK_APP_TOKEN env var (xapp-...) with connections:write scope.
 
@@ -29,7 +29,7 @@ from plugins.smartscout import SmartScoutPlugin
 
 logger = logging.getLogger(__name__)
 
-ALLOWED_CHANNELS = {"C0A5KV5QQ6S", "C0A5RG2HJVA"}
+ALLOWED_CHANNELS = {c.strip() for c in os.environ.get("SLASH_ALLOWED_CHANNELS", "").split(",") if c.strip()}
 
 _ss = SmartScoutPlugin()
 
@@ -37,7 +37,8 @@ _ss = SmartScoutPlugin()
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
-_CRED_KEY_ID = "g0d"
+# Key whose SmartScout credentials the slash command uses
+_CRED_KEY_ID = os.environ.get("SLASH_CRED_KEY_ID", auth.ADMIN_KEY_ID)
 
 
 def _set_admin_context() -> None:
@@ -311,7 +312,7 @@ def _handle_socket_event(client: SocketModeClient, req: SocketModeRequest) -> No
         client.send_socket_mode_response(
             SocketModeResponse(
                 envelope_id=req.envelope_id,
-                payload={"response_type": "ephemeral", "text": "This command is only available in #axisbrands."},
+                payload={"response_type": "ephemeral", "text": "This command is not enabled in this channel."},
             )
         )
         return

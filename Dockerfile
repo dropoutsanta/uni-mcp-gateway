@@ -9,6 +9,7 @@ FROM python:3.12-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     supervisor \
+    xvfb \
     && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir uv
 
@@ -16,7 +17,8 @@ WORKDIR /app
 COPY --from=go-builder /whatsapp-bridge /app/whatsapp-bridge
 COPY pyproject.toml .
 RUN uv pip install --system --no-cache -r pyproject.toml
-COPY *.py ./
+RUN playwright install --with-deps chromium
+COPY *.py *.sh *.example.json *.example.yaml ./
 COPY plugins/ ./plugins/
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 

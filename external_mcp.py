@@ -65,7 +65,7 @@ def _mcp_request(
     params: dict | None = None,
     headers: dict[str, str] | None = None,
     session_id: str | None = None,
-    timeout: int = 30,
+    timeout: int = 60,
 ) -> tuple[Any, str | None]:
     """Send a JSON-RPC request to a Streamable HTTP MCP server.
 
@@ -236,25 +236,34 @@ class ExternalMCPConnection:
         msg = str(exc).lower()
         return "session not found" in msg or "session expired" in msg or "invalid session" in msg
 
+    def _is_transient(self, exc: Exception) -> bool:
+        if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+            return True
+        msg = str(exc).lower()
+        return any(s in msg for s in ("timed out", "timeout", "502", "503", "504", "connection reset", "connection aborted"))
+
     def call_tool(self, tool_name: str, arguments: dict) -> Any:
-        """Proxy a tool call to the external server. Retries once on session expiry."""
+        """Proxy a tool call to the external server. Retries on session expiry and
+        transient upstream errors (timeouts, 502/503/504, connection resets)."""
         if not self.initialized:
             self.initialize()
 
-        for attempt in range(2):
+        max_attempts = 3
+        for attempt in range(max_attempts):
             try:
                 result, sid = _mcp_request(
                     self.url, "tools/call",
                     params={"name": tool_name, "arguments": arguments},
                     headers=self._headers(),
                     session_id=self.session_id,
-                    timeout=120,
+                    timeout=180,
                 )
                 if sid:
                     self.session_id = sid
                 return self._extract_result(result)
             except Exception as exc:
-                if attempt == 0 and self._is_session_error(exc):
+                last = attempt == max_attempts - 1
+                if not last and self._is_session_error(exc):
                     self.initialized = False
                     self.session_id = None
                     try:
@@ -263,6 +272,9 @@ class ExternalMCPConnection:
                     except Exception as init_exc:
                         self.last_error = str(init_exc)
                         return {"error": f"Re-init failed: {init_exc}"}
+                if not last and self._is_transient(exc):
+                    time.sleep([1, 3][attempt] if attempt < 2 else 3)
+                    continue
                 self.last_error = str(exc)
                 return {"error": f"External MCP call failed: {exc}"}
 

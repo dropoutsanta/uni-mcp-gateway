@@ -1155,7 +1155,7 @@ def _render_admin(key_info: dict, request: Request) -> HTMLResponse:
       <div class="form-row">
         <div class="form-group"><label>Key ID</label><input type="text" name="key_id" required placeholder="my-agent"></div>
         <div class="form-group"><label>Label</label><input type="text" name="label" placeholder="My Agent Key"></div>
-      </div>
+</div>
       <div class="form-row">
         <div class="form-group"><label>Rate Limit (req/min)</label><input type="number" name="rate_limit" value="100" min="0"></div>
         <div class="form-group"><label>Expiry (ISO date)</label><input type="text" name="expires_at" placeholder="2026-12-31T23:59:59"></div>

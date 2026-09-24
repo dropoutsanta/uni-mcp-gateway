@@ -1,0 +1,30 @@
+# Copy to litellm-config.yaml and point api_base at your pod.
+# Model names here should match the "models" list in llm-pods.json so the
+# wake-aware proxy knows which pod to start for each request.
+model_list:
+  - model_name: my-model
+    litellm_params:
+      model: openai/my-model
+      api_base: https://your-runpod-pod-id-8080.proxy.runpod.net/v1
+      api_key: os.environ/LLM_API_KEY
+      timeout: 600
+      stream_timeout: 600
+
+router_settings:
+  routing_strategy: simple-shuffle
+  num_retries: 1
+  retry_policy:
+    BadRequestErrorRetries: 0
+    AuthenticationErrorRetries: 0
+    TimeoutErrorRetries: 1
+    RateLimitErrorRetries: 0
+    ContentPolicyViolationErrorRetries: 0
+    InternalServerErrorRetries: 1
+  timeout: 600
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 600
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

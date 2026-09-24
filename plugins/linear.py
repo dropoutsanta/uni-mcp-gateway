@@ -279,9 +279,11 @@ def get_issue(issue_id: str) -> dict:
     issue = data.get("issue")
     if not issue:
         return {"error": "Issue not found"}
+    project = issue.get("project") or {}
+    cycle = issue.get("cycle") or {}
     result: dict[str, Any] = {"issue": _clean_issue(issue) | {
-        "project": {"id": (p := issue.get("project") or {}).get("id"), "name": p.get("name")} if p else None,
-        "cycle": {"id": (c := issue.get("cycle") or {}).get("id"), "name": c.get("name")} if c else None,
+        "project": {"id": project.get("id"), "name": project.get("name")} if project else None,
+        "cycle": {"id": cycle.get("id"), "name": cycle.get("name")} if cycle else None,
         "labels": [{"id": l.get("id"), "name": l.get("name"), "color": l.get("color")} for l in (issue.get("labels") or {}).get("nodes", [])],
         "attachments": [{"id": a.get("id"), "title": a.get("title"), "url": a.get("url")} for a in (issue.get("attachments") or {}).get("nodes", [])],
         "branchName": issue.get("branchName"),
@@ -372,7 +374,7 @@ def list_projects(
     query = f"""
     query {{
       projects(first: {min(limit, 250)}{after}{filter_str}) {{
-        nodes {{ id name slug description state targetDate icon }}
+        nodes {{ id name slug: slugId description state targetDate icon }}
         pageInfo {{ hasNextPage endCursor }}
       }}
     }}
@@ -394,7 +396,7 @@ def get_project(project_id: str) -> dict:
     query = """
     query($id: String!) {
       project(id: $id) {
-        id name slug description state targetDate icon color
+        id name slug: slugId description state targetDate icon color
         lead { id name email }
       }
     }
@@ -658,7 +660,9 @@ def save_issue(
             else:
                 input_parts.append("assigneeId: null")
         if label_ids is not None:
-            ids = json.dumps([{"id": lid} for lid in label_ids])
+            if isinstance(label_ids, str):
+                label_ids = [label_ids]
+            ids = json.dumps([str(lid) for lid in label_ids])
             input_parts.append(f"labelIds: {ids}")
         if project_id is not None:
             input_parts.append(f'projectId: "{project_id}"')
@@ -694,7 +698,9 @@ def save_issue(
         if assignee_id is not None:
             input_parts.append(f'assigneeId: "{assignee_id}"')
         if label_ids:
-            ids = json.dumps([{"id": lid} for lid in label_ids])
+            if isinstance(label_ids, str):
+                label_ids = [label_ids]
+            ids = json.dumps([str(lid) for lid in label_ids])
             input_parts.append(f"labelIds: {ids}")
         if project_id is not None:
             input_parts.append(f'projectId: "{project_id}"')
@@ -783,7 +789,7 @@ def save_project(
         mutation = f"""
         mutation {{
           projectUpdate(id: "{project_id_for_update}", input: {{ {inp} }}) {{
-            success project {{ id name slug }}
+            success project {{ id name slug: slugId }}
           }}
         }}
         """
@@ -806,7 +812,7 @@ def save_project(
         mutation = f"""
         mutation {{
           projectCreate(input: {{ {inp} }}) {{
-            success project {{ id name slug }}
+            success project {{ id name slug: slugId }}
           }}
         }}
         """

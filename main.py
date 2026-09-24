@@ -149,8 +149,11 @@ Only available to admin keys:
 - `gateway_add_account` — add a named account for any plugin
 - `gateway_set_credentials` — set/replace credentials for a key+plugin
 - `gateway_create_key`, `gateway_delete_key`, `gateway_list_keys` — key management
+- `gateway_set_global_rate_limit` — set a key's overall requests/min cap
 - `gateway_set_permissions`, `gateway_set_tool_override` — access control
 - `gateway_manage_scopes` — data-level scoping (e.g. allowed IDs per plugin)
+- `gateway_set_daily_spend_limit` — cap total USD spend per key per UTC day (e.g. Apify runs)
+- `gateway_get_daily_spend` — view today's spend vs limit for a key
 - `gateway_audit_log` — query the audit trail
 - `gateway_plugin_health` — check upstream service health
 """
@@ -192,6 +195,9 @@ def _register_plugins():
                         rl_err = auth.check_granular_rate_limit(ctx.key_id, p.name, f"{p.name}_{tn}", account)
                         if rl_err:
                             return {"error": rl_err}
+                        spend_rej = auth.spend_limit_rejection(ctx.key_id)
+                        if spend_rej:
+                            return spend_rej
                     t0 = time.time()
                     try:
                         result = h(**kwargs)
@@ -255,6 +261,9 @@ def _register_single_plugin(plugin: MCPPlugin):
                     rl_err = auth.check_granular_rate_limit(ctx.key_id, p.name, f"{p.name}_{tn}", account)
                     if rl_err:
                         return {"error": rl_err}
+                    spend_rej = auth.spend_limit_rejection(ctx.key_id)
+                    if spend_rej:
+                        return spend_rej
                 t0 = time.time()
                 try:
                     result = h(**kwargs)
@@ -825,6 +834,26 @@ def gateway_set_rate_limit(
 
 
 @mcp.tool()
+def gateway_set_global_rate_limit(key_id: str, rate_limit: int) -> dict:
+    """Set the GLOBAL per-key request cap (requests/minute) for a key. Admin only.
+
+    This is the key's overall sliding-window limit across ALL plugins and tools
+    (the one that returns HTTP 429 when exceeded). For per-plugin or per-tool
+    limits, use gateway_set_rate_limit with a scope instead.
+
+    Args:
+        key_id: The key ID (e.g. "client-a", "all-except-wa")
+        rate_limit: Max requests per minute across all tools (min 1, e.g. 1000)
+    """
+    ctx = _current_context.get()
+    if not ctx or not ctx.is_admin:
+        return {"error": "Admin access required"}
+    if rate_limit < 1:
+        return {"error": "rate_limit must be >= 1"}
+    return auth.set_global_rate_limit(key_id, rate_limit)
+
+
+@mcp.tool()
 def gateway_get_rate_limits(key_id: str) -> dict:
     """Get all granular rate limits for a key. Admin only."""
     ctx = _current_context.get()
@@ -838,6 +867,34 @@ def gateway_get_rate_limits(key_id: str) -> dict:
         global_info["global"] = row["rate_limit"]
     granular = auth.get_rate_limits(key_id)
     return {"key_id": key_id, "global_rate_limit": global_info.get("global", 100), "granular_limits": granular}
+
+
+@mcp.tool()
+def gateway_set_daily_spend_limit(key_id: str, limit_usd: float) -> dict:
+    """Set a daily total spend cap (USD, UTC calendar day) for a gateway key. Admin only.
+
+    Applies to billable plugin usage tracked by the gateway (currently Apify Actor runs).
+    Pass limit_usd=0 to remove the cap.
+
+    Args:
+        key_id: The key ID (e.g. "admin", "all-except-wa")
+        limit_usd: Max USD spend per UTC day (e.g. 100 for $100/day). Use 0 to disable.
+    """
+    ctx = _current_context.get()
+    if not ctx or not ctx.is_admin:
+        return {"error": "Admin access required"}
+    if limit_usd <= 0:
+        return auth.set_daily_spend_limit(key_id, None)
+    return auth.set_daily_spend_limit(key_id, float(limit_usd))
+
+
+@mcp.tool()
+def gateway_get_daily_spend(key_id: str) -> dict:
+    """Get today's tracked spend vs configured daily limit for a key. Admin only."""
+    ctx = _current_context.get()
+    if not ctx or not ctx.is_admin:
+        return {"error": "Admin access required"}
+    return auth.get_daily_spend_status(key_id)
 
 
 @mcp.tool()
@@ -1645,7 +1702,7 @@ def _build_app() -> ASGIApp:
     runpod_api_key = os.environ.get("RUNPOD_API_KEY", "")
     # Persist slot→pod_id mapping to the Fly volume so that auto-respawned
     # pod_ids survive gateway restarts. Without this the registry boots with
-    # whatever pod_id is hard-coded in POD_CONFIGS and points at a (likely
+    # whatever pod_id is in the pod config file and points at a (likely
     # terminated) old pod until the next respawn fires.
     pod_state_path = os.environ.get("POD_STATE_PATH", "/data/pod_state.json")
     pod_registry = llm_proxy.build_pod_registry(runpod_api_key, state_path=pod_state_path)

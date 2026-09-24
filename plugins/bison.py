@@ -6,6 +6,7 @@ get_credentials("bison") which returns {"api_key": "...", "base_url": "..."}.
 
 
 import json
+import os
 from typing import Any, Optional
 
 import httpx
@@ -34,6 +35,16 @@ def p(name: str, t: str = "str", req: bool = True, d: str = ""):
 
 
 # Admin-level tools (user/workspace management)
+# Workspace invite uses custom handlers (API expects email + role, not emails-only).
+_INVITE_SKIP_AUTO_REGISTER = frozenset({
+    "workspaces_invite_members",
+    "workspaces_v11_invite_members",
+})
+# EmailBison only accepts admin | editor | client (not "member").
+_DEFAULT_BISON_INVITE_ROLE = "editor"
+# EmailBison instances are per-customer; set base_url in credentials or here.
+_DEFAULT_BASE_URL = os.environ.get("BISON_BASE_URL", "")
+
 ADMIN_TOOLS = frozenset({
     "users_update_password",
     "users_headless_ui_token",
@@ -93,16 +104,18 @@ def _get_bison_account_credentials(account: str = "") -> dict:
 
     if selected == "default":
         api_key = creds.get("api_key", "")
-        base_url = creds.get("base_url", "https://send.topoffunnel.com")
+        base_url = creds.get("base_url", _DEFAULT_BASE_URL)
     else:
         api_key = creds.get(f"{selected}.api_key", "")
-        base_url = creds.get(f"{selected}.base_url", "https://send.topoffunnel.com")
+        base_url = creds.get(f"{selected}.base_url", _DEFAULT_BASE_URL)
 
     if not api_key:
         return {
             "error": f"No Bison credentials found for account '{selected}'.",
             "available_accounts": _list_bison_accounts(),
         }
+    if not base_url:
+        return {"error": f"No Bison base_url configured for account '{selected}' (set the base_url credential or BISON_BASE_URL)."}
 
     return {
         "account": selected,
@@ -989,9 +1002,8 @@ cmd("workspaces_switch", "Switch to a different workspace.", "POST", "/api/works
     [p("team_id", d="Workspace/team ID to switch to")],
     {"team_id": "body"})
 
-cmd("workspaces_invite_members", "Invite members to the workspace.", "POST", "/api/workspaces/invite-members",
-    [p("emails", d="JSON array of email addresses to invite")],
-    {"emails": "body"})
+cmd("workspaces_invite_members", "See plugin: email+role (default editor); roles admin|editor|client only.", "POST", "/api/workspaces/invite-members",
+    [], {})
 
 cmd("workspaces_accept_invite", "Accept a workspace invitation.", "POST", "/api/workspaces/accept/{team_invitation_id}",
     [p("team_invitation_id", d="Invitation ID")],
@@ -1041,9 +1053,8 @@ cmd("workspaces_v11_create_user", "Create a user in the workspace (v1.1 API).", 
      p("role", d="User role (e.g. admin, member)")],
     {"name": "body", "email": "body", "password": "body", "role": "body"})
 
-cmd("workspaces_v11_invite_members", "Invite members to workspace (v1.1 API).", "POST", "/api/workspaces/v1.1/invite-members",
-    [p("emails", d="JSON array of email addresses")],
-    {"emails": "body"})
+cmd("workspaces_v11_invite_members", "See plugin: switch workspace then email+role; default editor; admin|editor|client only.", "POST", "/api/workspaces/v1.1/invite-members",
+    [], {})
 
 cmd("workspaces_v11_accept_invite", "Accept a workspace invitation (v1.1 API).", "POST", "/api/workspaces/v1.1/accept/{team_invitation_id}",
     [p("team_invitation_id", d="Invitation ID")],
@@ -1090,9 +1101,105 @@ class BisonPlugin(MCPPlugin):
         self._register_meta_tools()
         for cmd_def in COMMANDS:
             self._register_tool(cmd_def)
+        self._register_workspace_invite_tools()
+
+    def _register_workspace_invite_tools(self) -> None:
+        invite_desc_v1 = (
+            "EmailBison: invite ONE person to the *current* workspace (POST /api/workspaces/invite-members). "
+            "WORKFLOW: (1) bison_workspaces_v11_switch team_id=<workspace id> account=… "
+            "(2) bison_workspaces_invite_members email=… role=… — body MUST be singular email + role, NOT a list. "
+            f"ROLE: only admin, editor, or client are valid; omit role to default to {_DEFAULT_BISON_INVITE_ROLE}. "
+            "Legacy: pass emails= JSON array of strings only if the tenant still accepts bulk invites without role. "
+            "Optional: account (e.g. client-admin)."
+        )
+        invite_desc_v11 = (
+            "EmailBison: invite ONE person to the *current* workspace — USE THIS for v1.1 "
+            "(POST /api/workspaces/v1.1/invite-members). "
+            "WORKFLOW: (1) bison_workspaces_v11_switch team_id=<id> account=… "
+            "(2) bison_workspaces_v11_invite_members email=… role=… "
+            f"Params: email (required unless using legacy emails=). role defaults to {_DEFAULT_BISON_INVITE_ROLE}. "
+            "VALID ROLES ONLY: admin | editor | client — using member returns HTTP 422. "
+            "Legacy bulk: emails= JSON array of addresses (rare). Optional: account."
+        )
+        self.tools["workspaces_invite_members"] = ToolDef(
+            access="admin",
+            handler=self.workspaces_invite_members,
+            description=invite_desc_v1,
+        )
+        self.tools["workspaces_v11_invite_members"] = ToolDef(
+            access="admin",
+            handler=self.workspaces_v11_invite_members,
+            description=invite_desc_v11,
+        )
+
+    @staticmethod
+    def _invite_body(
+        email: str,
+        role: str,
+        emails: Optional[str],
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {}
+        if email and str(email).strip():
+            body["email"] = str(email).strip()
+            r = (role or _DEFAULT_BISON_INVITE_ROLE).strip() or _DEFAULT_BISON_INVITE_ROLE
+            body["role"] = r
+            return body
+        if emails:
+            try:
+                parsed = json.loads(emails)
+            except json.JSONDecodeError as e:
+                return {"error": f"Invalid emails JSON: {e}"}
+            if not isinstance(parsed, list):
+                return {"error": "emails must be a JSON array of addresses"}
+            body["emails"] = parsed
+            return body
+        return {
+            "error": (
+                "Provide email (and optional role: admin|editor|client; "
+                f"default {_DEFAULT_BISON_INVITE_ROLE}) or emails as a JSON array."
+            )
+        }
+
+    def workspaces_invite_members(
+        self,
+        email: str = "",
+        role: str = _DEFAULT_BISON_INVITE_ROLE,
+        emails: Optional[str] = None,
+        account: str = "",
+    ) -> dict:
+        """Invite members to the workspace."""
+        body = self._invite_body(email, role, emails)
+        if "error" in body:
+            return body
+        mappings = {k: "body" for k in body}
+        return _bison_request(
+            "POST", "/api/workspaces/invite-members", body, mappings, account=account
+        )
+
+    def workspaces_v11_invite_members(
+        self,
+        email: str = "",
+        role: str = _DEFAULT_BISON_INVITE_ROLE,
+        emails: Optional[str] = None,
+        account: str = "",
+    ) -> dict:
+        """Invite members to workspace (v1.1 API)."""
+        body = self._invite_body(email, role, emails)
+        if "error" in body:
+            return body
+        mappings = {k: "body" for k in body}
+        return _bison_request(
+            "POST",
+            "/api/workspaces/v1.1/invite-members",
+            body,
+            mappings,
+            account=account,
+        )
 
     def _register_tool(self, cmd_def: dict) -> None:
         name = cmd_def["name"]
+        if name in _INVITE_SKIP_AUTO_REGISTER:
+            return
         desc = cmd_def["description"]
         method = cmd_def["method"]
         path = cmd_def["path"]

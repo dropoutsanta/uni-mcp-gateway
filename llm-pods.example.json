@@ -1,0 +1,36 @@
+{
+  "pods": [
+    {
+      "slot_key": "primary",
+      "pod_id": "your-runpod-pod-id",
+      "name": "primary",
+      "api_base": "https://your-runpod-pod-id-8080.proxy.runpod.net/v1",
+      "health_url": "https://your-runpod-pod-id-8080.proxy.runpod.net/health",
+      "models": ["my-model"],
+      "idle_timeout_s": 3600,
+      "max_respawns": 2,
+      "template": {
+        "image_name": "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04",
+        "gpu_type_id": "NVIDIA A100 80GB PCIe",
+        "cloud_type": "SECURE",
+        "gpu_count": 1,
+        "container_disk_in_gb": 25,
+        "volume_in_gb": 60,
+        "volume_mount_path": "/cache",
+        "ports": "8080/http,22/tcp",
+        "name_prefix": "my-model-auto",
+        "entrypoint_path": "/app/runpod_entrypoint.sh",
+        "env": {
+          "MODEL_CACHE": "/cache",
+          "MODEL_REPO": "your-org/your-model-GGUF",
+          "MODEL_FILE": "your-model-Q8_0.gguf",
+          "MODEL_ALIAS": "my-model",
+          "CTX_SIZE": "32768",
+          "PORT": "8080",
+          "LLAMA_API_KEY": "${LLM_API_KEY}",
+          "PUBLIC_KEY": "${RUNPOD_SSH_PUBKEY}"
+        }
+      }
+    }
+  ]
+}

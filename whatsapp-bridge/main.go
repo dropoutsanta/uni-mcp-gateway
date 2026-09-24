@@ -1579,9 +1579,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "id query param required"})
 				return
 			}
-			if keyID == "g0d" {
+			adminKeyID := os.Getenv("ADMIN_KEY_ID")
+			if adminKeyID == "" {
+				adminKeyID = "admin"
+			}
+			if keyID == adminKeyID {
 				w.WriteHeader(http.StatusForbidden)
-				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "cannot delete g0d key"})
+				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "cannot delete " + adminKeyID + " key"})
 				return
 			}
 			messageStore.db.Exec(`DELETE FROM access_key_scopes WHERE key_id = ?`, keyID)

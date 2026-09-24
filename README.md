@@ -53,7 +53,7 @@ We run AI agents across dozens of environments — Cursor, Claude Desktop, Openc
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/nickcold/uni-mcp-gateway.git
+git clone https://github.com/dropoutsanta/uni-mcp-gateway.git
 cd uni-mcp-gateway
 pip install -e .
 ```
@@ -193,6 +193,47 @@ gateway_set_rate_limit(key_id="staging-bot", scope="tool:gmail_messages_send", r
 | `bison` | EmailBison API | Email campaign management, warmup, workspaces |
 | `ai_ark` | AI Ark API | People/company search, email finder, phone lookup |
 | `whatsapp` | WhatsApp (self-hosted bridge) | Send/receive messages, media, contacts (requires Go bridge) |
+| `instantly` | Instantly API v2 | Campaigns, leads, sending accounts, unibox, analytics |
+| `bigquery` | Google BigQuery | Run queries, list datasets and tables |
+| `hubspot` | HubSpot API | Contacts, companies, deals, engagements |
+| `hubspot_meetings` | HubSpot Meetings | Read open slots and book meetings (Playwright) |
+| `heyreach` | HeyReach API | LinkedIn outreach campaigns, lists, inbox |
+| `contactout` | ContactOut API | Contact lookup by LinkedIn URL, name or email |
+| `reoon` | Reoon API | Single and bulk email verification |
+| `perplexity` | Perplexity API | Web-grounded Q&A |
+| `apify` | Apify API | Run actors and fetch datasets (respects per-key daily spend limits) |
+| `smartscout` | SmartScout API | Amazon brand, product, seller and search-term data |
+| `brandnav` | BrandNav | Shopify/DTC brand screener and exports (browser-cookie auth) |
+| `fathom` | Fathom API | Meeting recordings, transcripts, summaries |
+| `granola` | Granola | Meeting notes, transcripts, attendees (optional folder scoping) |
+| `dayai` | Day.ai | CRM objects, recordings and transcripts |
+| `spaceship` | Spaceship API | Domains and DNS records |
+| `coldmessage_slash` | Slack Socket Mode | `/coldmessage` slash command for SmartScout lookups (channels via `SLASH_ALLOWED_CHANNELS`) |
+
+Set `PLUGINS_ALLOWLIST` (comma-separated) to load only some plugins.
+
+## LLM Proxy (optional)
+
+`/llm/*` is a wake-aware reverse proxy in front of a local LiteLLM server. It
+maps each chat-completion request's `model` to a RunPod GPU pod, resumes the
+pod if it's asleep (streaming progress to the client during cold start), stops
+it after an idle timeout, and can respawn it on another host when its host is
+full.
+
+1. Copy `litellm-config.example.yaml` → `litellm-config.yaml` and
+   `llm-pods.example.json` → `llm-pods.json`, and fill in your pods and models.
+2. Set `RUNPOD_API_KEY`, `LITELLM_MASTER_KEY` and `LLM_API_KEY`.
+3. `runpod_entrypoint.sh` is a generic llama.cpp bootstrap for pods
+   (set `MODEL_REPO` / `MODEL_FILE`); it is also used for auto-respawn.
+
+Status and control: `GET /llm/status`, `POST /llm/wake?pod=ID`, `POST /llm/sleep?pod=ID`.
+
+## Spend Limits
+
+Each key can have a daily USD spend cap (UTC day) for paid tools such as Apify:
+`gateway_set_daily_spend_limit`, `gateway_get_daily_spend`. Calls are rejected
+once the cap is reached. `gateway_set_global_rate_limit` sets a key's overall
+per-minute request cap.
 
 All plugins wrap public APIs. Remove any you don't need by deleting the file from `plugins/`.
 
@@ -248,6 +289,11 @@ fly deploy
 | `ADMIN_KEY_ID` | `admin` | ID for the admin key |
 | `PORT` / `MCP_PORT` | `8080` | Server port |
 | `WHATSAPP_BRIDGE_URL` | `http://localhost:7481` | WhatsApp Go bridge URL |
+| `PLUGINS_ALLOWLIST` | (all) | Comma-separated plugins to load |
+| `LLM_PODS_CONFIG` | `/app/llm-pods.json` | Pod/model config for the LLM proxy |
+| `RUNPOD_API_KEY` | | RunPod API key for the LLM proxy |
+| `POD_STATE_PATH` | `/data/pod_state.json` | Persisted slot→pod mapping |
+| `BISON_BASE_URL` | | Default EmailBison instance URL |
 
 ## License
 

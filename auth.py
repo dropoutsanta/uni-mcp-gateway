@@ -64,6 +64,13 @@ CREATE TABLE IF NOT EXISTS key_rate_limits (
     rate_limit INTEGER NOT NULL,
     PRIMARY KEY (key_id, scope)
 );
+
+CREATE TABLE IF NOT EXISTS key_daily_spend (
+    key_id TEXT NOT NULL,
+    day TEXT NOT NULL,
+    amount_usd REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (key_id, day)
+);
 """
 
 
@@ -84,6 +91,8 @@ def init_db() -> None:
     cols = [r[1] for r in conn.execute("PRAGMA table_info(keys)").fetchall()]
     if "can_audit" not in cols:
         conn.execute("ALTER TABLE keys ADD COLUMN can_audit INTEGER DEFAULT 1")
+    if "daily_spend_limit_usd" not in cols:
+        conn.execute("ALTER TABLE keys ADD COLUMN daily_spend_limit_usd REAL")
     conn.commit()
     conn.close()
     _ensure_admin_key()
@@ -97,15 +106,21 @@ def _ensure_admin_key() -> None:
     conn = _get_db()
     existing = conn.execute("SELECT id FROM keys WHERE id = ?", (ADMIN_KEY_ID,)).fetchone()
     if not existing:
-        conn.execute(
-            "INSERT INTO keys (id, api_key, label, is_admin) VALUES (?, ?, ?, 1)",
-            (ADMIN_KEY_ID, master_token, "Admin (master)"),
-        )
-        conn.commit()
-        print(f"[auth] seeded admin key '{ADMIN_KEY_ID}'", flush=True)
+        try:
+            conn.execute(
+                "INSERT INTO keys (id, api_key, label, is_admin) VALUES (?, ?, ?, 1)",
+                (ADMIN_KEY_ID, master_token, "Admin (master)"),
+            )
+            conn.commit()
+            print(f"[auth] seeded admin key '{ADMIN_KEY_ID}'", flush=True)
+        except Exception:
+            conn.rollback()
     else:
-        conn.execute("UPDATE keys SET api_key = ? WHERE id = ?", (master_token, ADMIN_KEY_ID))
-        conn.commit()
+        try:
+            conn.execute("UPDATE keys SET api_key = ? WHERE id = ?", (master_token, ADMIN_KEY_ID))
+            conn.commit()
+        except Exception:
+            conn.rollback()
     conn.close()
 
 
@@ -238,6 +253,162 @@ def delete_rate_limit(key_id: str, scope: str) -> dict:
     return {"success": True, "key_id": key_id, "scope": scope}
 
 
+def set_global_rate_limit(key_id: str, rate_limit: int) -> dict:
+    """Update the key's overall per-minute request cap (keys.rate_limit)."""
+    conn = _get_db()
+    cur = conn.execute("UPDATE keys SET rate_limit = ? WHERE id = ?", (rate_limit, key_id))
+    conn.commit()
+    changed = cur.rowcount
+    conn.close()
+    if not changed:
+        return {"error": f"Key '{key_id}' not found"}
+    _rate_windows.pop(key_id, None)
+    return {"success": True, "key_id": key_id, "rate_limit": rate_limit}
+
+
+# ── Daily spend limits (USD, UTC calendar day) ───────────────────────────────
+
+def _today_utc() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def get_daily_spend_limit(key_id: str) -> float | None:
+    conn = _get_db()
+    row = conn.execute(
+        "SELECT daily_spend_limit_usd FROM keys WHERE id = ?", (key_id,)
+    ).fetchone()
+    conn.close()
+    if not row or row["daily_spend_limit_usd"] is None:
+        return None
+    return float(row["daily_spend_limit_usd"])
+
+
+def get_daily_spend_used(key_id: str, day: str | None = None) -> float:
+    day = day or _today_utc()
+    conn = _get_db()
+    row = conn.execute(
+        "SELECT amount_usd FROM key_daily_spend WHERE key_id = ? AND day = ?",
+        (key_id, day),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return 0.0
+    return float(row["amount_usd"])
+
+
+def get_daily_spend_status(key_id: str) -> dict:
+    limit = get_daily_spend_limit(key_id)
+    used = get_daily_spend_used(key_id)
+    remaining = None if limit is None else max(0.0, limit - used)
+    return {
+        "key_id": key_id,
+        "day_utc": _today_utc(),
+        "spent_usd": round(used, 6),
+        "limit_usd": limit,
+        "remaining_usd": round(remaining, 6) if remaining is not None else None,
+    }
+
+
+def check_daily_spend_limit(key_id: str) -> str | None:
+    limit = get_daily_spend_limit(key_id)
+    if limit is None or limit <= 0:
+        return None
+    used = get_daily_spend_used(key_id)
+    if used >= limit:
+        return f"Daily spend limit exceeded (${used:.4f} / ${limit:.2f} USD today UTC)"
+    return None
+
+
+def _next_utc_reset() -> Any:
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    reset = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return now, reset
+
+
+def spend_limit_rejection(key_id: str) -> dict | None:
+    """Return a structured rejection payload if the key is at/over its daily
+    spend limit, otherwise None. Used as a soft pre-flight check on every call."""
+    limit = get_daily_spend_limit(key_id)
+    if limit is None or limit <= 0:
+        return None
+    used = get_daily_spend_used(key_id)
+    if used < limit:
+        return None
+
+    now, reset = _next_utc_reset()
+    delta = reset - now
+    total_min = max(0, int(delta.total_seconds() // 60))
+    hours, minutes = divmod(total_min, 60)
+    resets_in = f"{hours}h {minutes}m"
+    resets_at = reset.strftime("%Y-%m-%d %H:%M UTC")
+
+    return {
+        "error": "daily_spend_limit_reached",
+        "message": (
+            f"Daily usage limit reached: ${used:.2f} of ${limit:.2f} used today (UTC). "
+            f"Limit resets in {resets_in} (at {resets_at}). "
+            f"Please contact your admin to increase this limit."
+        ),
+        "spent_usd": round(used, 4),
+        "limit_usd": round(limit, 2),
+        "resets_in": resets_in,
+        "resets_at_utc": resets_at,
+        "action": "Contact your admin to increase the daily limit, or wait until it resets.",
+    }
+
+
+def record_spend(key_id: str, amount_usd: float, day: str | None = None) -> dict:
+    if amount_usd <= 0:
+        return {"recorded": 0.0}
+    day = day or _today_utc()
+    conn = _get_db()
+    conn.execute(
+        "INSERT INTO key_daily_spend (key_id, day, amount_usd) VALUES (?,?,?) "
+        "ON CONFLICT(key_id, day) DO UPDATE SET amount_usd = amount_usd + excluded.amount_usd",
+        (key_id, day, amount_usd),
+    )
+    conn.commit()
+    used = get_daily_spend_used(key_id, day)
+    conn.close()
+    return {"recorded": round(amount_usd, 6), "spent_usd_today": round(used, 6)}
+
+
+def set_daily_spend_limit(key_id: str, limit_usd: float | None) -> dict:
+    conn = _get_db()
+    conn.execute(
+        "UPDATE keys SET daily_spend_limit_usd = ? WHERE id = ?",
+        (limit_usd, key_id),
+    )
+    conn.commit()
+    conn.close()
+    return {
+        "success": True,
+        "key_id": key_id,
+        "daily_spend_limit_usd": limit_usd,
+        **get_daily_spend_status(key_id),
+    }
+
+
+def extract_spend_from_result(result: Any) -> float:
+    if not isinstance(result, dict):
+        return 0.0
+    for key in ("usageTotalUsd", "usageUsd", "costUsd", "cost_usd", "totalCostUsd"):
+        val = result.get(key)
+        if val is not None:
+            try:
+                amount = float(val)
+                if amount > 0:
+                    return amount
+            except (TypeError, ValueError):
+                pass
+    data = result.get("data")
+    if isinstance(data, dict):
+        return extract_spend_from_result(data)
+    return 0.0
+
+
 # ── Permissions ───────────────────────────────────────────────────────────────
 
 def get_key_permissions(key_id: str) -> dict[str, set[str]]:
@@ -330,7 +501,7 @@ def delete_key(key_id: str) -> dict:
 def list_keys() -> list[dict]:
     conn = _get_db()
     rows = conn.execute(
-        "SELECT id, label, is_admin, rate_limit, expires_at, allowed_ips, can_audit, created_at FROM keys"
+        "SELECT id, label, is_admin, rate_limit, expires_at, allowed_ips, can_audit, daily_spend_limit_usd, created_at FROM keys"
     ).fetchall()
     conn.close()
     result = []

@@ -172,8 +172,9 @@ def list_access_keys() -> List[dict]:
 
 def delete_access_key(key_id: str) -> dict:
     """Delete an access key and its scopes."""
-    if key_id == "g0d":
-        return {"success": False, "message": "Cannot delete g0d key"}
+    admin_key_id = os.environ.get("ADMIN_KEY_ID", "admin")
+    if key_id == admin_key_id:
+        return {"success": False, "message": f"Cannot delete {admin_key_id} key"}
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         conn.execute("DELETE FROM access_key_scopes WHERE key_id = ?", (key_id,))

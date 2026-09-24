@@ -13,6 +13,8 @@ dependencies = [
     "playwright>=1.49.0",
     "slack_sdk>=3.33.0",
     "websocket-client>=1.8.0",
+    "litellm[proxy]>=1.55.0",
+    "pyyaml>=6.0",
 ]
 
 [build-system]

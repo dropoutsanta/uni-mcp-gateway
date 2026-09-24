@@ -97,7 +97,7 @@ def _load_receipt_id(track_id: str) -> str | None:
 
 def _webhook_url_for(receipt_id: str) -> str:
     """Generate the MCP gateway webhook URL for a given receipt ID."""
-    base = os.environ.get("MCP_BASE_URL", "https://shitty-agent-gateway-27.fly.dev").rstrip("/")
+    base = os.environ.get("MCP_BASE_URL", "http://localhost:8080").rstrip("/")
     return f"{base}/webhook/{receipt_id}"
 
 
@@ -136,6 +136,9 @@ class AiArkPlugin(MCPPlugin):
                     "0.5 CREDITS PER RESULT. Search 400M+ people profiles. Returns up to 100 profiles per call\n"
                     "(no polling). Does NOT include email addresses — use\n"
                     "export_people_with_email to get emails.\n\n"
+                    "Optional: max_per_company (int) — cap results per company so one\n"
+                    "large org doesn't dominate. E.g. max_per_company=3 returns at\n"
+                    "most 3 people from any single company.\n\n"
                     "For larger result sets, parallelize with page offsets (page=0,\n"
                     "page=1, ...). API supports 5 requests/second.\n"
                 ),
@@ -186,7 +189,12 @@ class AiArkPlugin(MCPPlugin):
             "get_export_results": ToolDef(
                 access="read",
                 handler=self.get_export_results,
-                description="Get the results of an email export. Poll this after export_people_with_email or find_emails_by_track_id.",
+                description=(
+                    "Get the results of an email export. Poll this after "
+                    "export_people_with_email or find_emails_by_track_id.\n\n"
+                    "Optional: max_per_company (int) — cap results per company "
+                    "so one large org doesn't dominate the export."
+                ),
             ),
             "list_previous_exports": ToolDef(
                 access="read",
@@ -496,7 +504,24 @@ class AiArkPlugin(MCPPlugin):
                 "   Company: domains, company_names, industries, company_hq_locations,\n"
                 "            employee_size, company_types, technologies,\n"
                 "            company_keywords, founded_year_start/end,\n"
-                "            revenue_start/end\n"
+                "            revenue_start/end\n\n"
+                "7. AMAZON BRAND PROSPECTING (with SmartScout)\n"
+                "   When you have Amazon brand names from SmartScout and need\n"
+                "   contact info for brand owners:\n\n"
+                "   a) search_companies(company_names='BrandName', size=3)\n"
+                "      → pick the match where brand name appears in domain\n"
+                "      → extract the domain (e.g. 'examplebrand.com')\n\n"
+                "   b) search_people(domains='examplebrand.com',\n"
+                "      job_titles='CEO,Founder,Owner', max_per_company=2)\n"
+                "      → get the actual people\n\n"
+                "   c) export_people_with_email(...) → get verified emails\n\n"
+                "   IMPORTANT: Always resolve brand → domain via search_companies\n"
+                "   first. Do NOT pass brand names directly to search_people's\n"
+                "   company_names param — it's too fuzzy and returns wrong people\n"
+                "   from unrelated companies. Domains are precise.\n\n"
+                "   Expect ~53% hit rate on domain resolution. For misses, use\n"
+                "   perplexity_ask('What company owns the Amazon brand X?') as\n"
+                "   fallback.\n"
             )
         }
 
@@ -596,6 +621,7 @@ class AiArkPlugin(MCPPlugin):
         revenue_end: Optional[int] = None,
         page: int = 0,
         size: int = 25,
+        max_per_company: Optional[int] = None,
     ) -> dict:
         body = self._build_people_body(
             filters_json=filters_json, job_titles=job_titles, locations=locations,
@@ -612,7 +638,25 @@ class AiArkPlugin(MCPPlugin):
         if "error" in body:
             return body
 
-        return self._ark_request("POST", "/v1/people", body=body)
+        result = self._ark_request("POST", "/v1/people", body=body)
+        if max_per_company and isinstance(result, dict):
+            key = "content" if "content" in result else "data"
+            if key in result:
+                result[key] = self._cap_per_company(result[key], max_per_company)
+                result["_filtered_count"] = len(result[key])
+                result["_max_per_company"] = max_per_company
+        return result
+
+    @staticmethod
+    def _cap_per_company(data: list, cap: int) -> list:
+        counts: dict[str, int] = {}
+        filtered = []
+        for person in data:
+            co = (person.get("company") or {}).get("summary", {}).get("name") or "_unknown_"
+            counts[co] = counts.get(co, 0) + 1
+            if counts[co] <= cap:
+                filtered.append(person)
+        return filtered
 
     def export_people_with_email(
         self,
@@ -732,13 +776,20 @@ class AiArkPlugin(MCPPlugin):
             }
         return stats
 
-    def get_export_results(self, track_id: str) -> dict:
+    def get_export_results(self, track_id: str, max_per_company: Optional[int] = None) -> dict:
         receipt_id = _load_receipt_id(track_id)
         if receipt_id:
             result_path = _RESULTS_DIR / f"{receipt_id}.json"
             if result_path.exists():
                 try:
-                    return json.loads(result_path.read_text())
+                    result = json.loads(result_path.read_text())
+                    if max_per_company and isinstance(result, dict):
+                        key = "content" if "content" in result else "data"
+                        if key in result:
+                            result[key] = self._cap_per_company(result[key], max_per_company)
+                            result["_filtered_count"] = len(result[key])
+                            result["_max_per_company"] = max_per_company
+                    return result
                 except Exception as exc:
                     return {"error": f"Failed to read results: {exc}"}
 
