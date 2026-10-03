@@ -44,6 +44,7 @@ from plugins import discover_plugins
 _MCP_BASE_URL = os.environ.get("MCP_BASE_URL", "http://localhost:8080")
 _STATE_PATH = Path(os.environ.get("OAUTH_STATE_PATH", "/data/oauth_state.json"))
 _MCP_PORT = int(os.environ.get("MCP_PORT", "8080"))
+_MCP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
 
 _RETRYABLE_CODES = {502, 503, 504, 429}
 _MAX_RETRIES = 2
@@ -161,7 +162,7 @@ Only available to admin keys:
 mcp = FastMCP(
     "mcp-gateway",
     instructions=_GATEWAY_INSTRUCTIONS,
-    host="0.0.0.0",
+    host=_MCP_HOST,
     port=_MCP_PORT,
     stateless_http=True,
 )
@@ -1747,6 +1748,6 @@ if __name__ == "__main__":
     import uvicorn
 
     app = _build_app()
-    config = uvicorn.Config(app, host="0.0.0.0", port=_MCP_PORT, log_level="info")
+    config = uvicorn.Config(app, host=_MCP_HOST, port=_MCP_PORT, log_level="info")
     server = uvicorn.Server(config)
     server.run()

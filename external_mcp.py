@@ -18,7 +18,7 @@ import requests
 
 from plugin_base import MCPPlugin, ToolDef
 
-_DB_PATH = os.environ.get("GATEWAY_DB", "/data/gateway.db")
+_DB_PATH = os.environ.get("GATEWAY_DB") or os.environ.get("GATEWAY_DB_PATH", "/data/gateway.db")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS external_mcps (

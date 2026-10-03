@@ -306,6 +306,19 @@ def chat_post_message(
     return _slack_request("POST", "chat.postMessage", body=body)
 
 
+def drafts_create(channel: str, text: str) -> dict:
+    """Save a message as an unsent draft in the user's Slack composer for a channel or DM. The user reviews and sends it. channel: channel or DM ID. text: plain text (newlines kept). Requires a user token (xoxp); Slack's drafts.create is undocumented and allows one attached draft per conversation."""
+    import uuid
+    body = {
+        "client_msg_id": str(uuid.uuid4()),
+        "blocks": [{"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": [{"type": "text", "text": text}]}]}],
+        "destinations": [{"channel_id": channel}],
+        "file_ids": [],
+        "is_from_composer": False,
+    }
+    return _slack_request("POST", "drafts.create", body=body)
+
+
 def chat_update(
     channel: str,
     ts: str,
@@ -1030,6 +1043,8 @@ class SlackPlugin(MCPPlugin):
         # Chat — write
         "chat_post_message": ToolDef(access="write", handler=chat_post_message,
             description="Send a message to a channel. Supports text (mrkdwn), blocks (JSON string of Block Kit), attachments, and threading (thread_ts)."),
+        "drafts_create": ToolDef(access="write", handler=drafts_create,
+            description="Save an unsent draft in the user's composer for a channel or DM (user token only). The user sends it themselves. One draft per conversation."),
         "chat_update": ToolDef(access="write", handler=chat_update,
             description="Update an existing message. Provide channel + ts + new text/blocks/attachments."),
         "chat_delete": ToolDef(access="write", handler=chat_delete,

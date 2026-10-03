@@ -63,14 +63,18 @@ pip install -e .
 ```bash
 export MCP_AUTH_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
 export MCP_BASE_URL=http://localhost:8080
-export GATEWAY_DB_PATH=./gateway.db
+export GATEWAY_DB_PATH=./data/gateway.db
+# Local runs: the other state paths default to /data (the Fly volume), which is read-only on macOS
+export OAUTH_STATE_PATH=./data/oauth_state.json POD_STATE_PATH=./data/pod_state.json RESULTS_DIR=./data/results
 echo "Your admin token: $MCP_AUTH_TOKEN"
 ```
 
 ### 3. Run
 
 ```bash
-python -m uvicorn main:app --host 0.0.0.0 --port 8080
+python main.py
+# or: python -m uvicorn main:_build_app --factory --host 0.0.0.0 --port 8080
+# Local-only: export MCP_HOST=127.0.0.1 first so the gateway is not exposed on your network
 ```
 
 ### 4. Connect
@@ -189,7 +193,7 @@ gateway_set_rate_limit(key_id="staging-bot", scope="tool:gmail_messages_send", r
 | `calendly` | Calendly API | Event types, scheduled events, invitees, routing forms |
 | `linear` | Linear API | Issues, projects, teams, comments, labels |
 | `notion` | Notion API | Pages, databases, blocks, search |
-| `slack` | Slack Web API | Messages, channels, users, reactions, files, user groups |
+| `slack` | Slack Web API | Messages, channels, users, reactions, files, user groups, unsent drafts (`drafts_create`, needs a user `xoxp-` token) |
 | `bison` | EmailBison API | Email campaign management, warmup, workspaces |
 | `ai_ark` | AI Ark API | People/company search, email finder, phone lookup |
 | `whatsapp` | WhatsApp (self-hosted bridge) | Send/receive messages, media, contacts (requires Go bridge) |
@@ -288,6 +292,7 @@ fly deploy
 | `GATEWAY_DB_PATH` | `/data/gateway.db` | SQLite database path |
 | `ADMIN_KEY_ID` | `admin` | ID for the admin key |
 | `PORT` / `MCP_PORT` | `8080` | Server port |
+| `MCP_HOST` | `0.0.0.0` | Bind address (`127.0.0.1` for local-only) |
 | `WHATSAPP_BRIDGE_URL` | `http://localhost:7481` | WhatsApp Go bridge URL |
 | `PLUGINS_ALLOWLIST` | (all) | Comma-separated plugins to load |
 | `LLM_PODS_CONFIG` | `/app/llm-pods.json` | Pod/model config for the LLM proxy |
